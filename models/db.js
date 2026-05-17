@@ -54,6 +54,9 @@ const approvedChatSchema = new mongoose.Schema(
     type: { type: String, enum: ['group', 'channel'], default: 'group' },
     approvedAt: { type: Date, default: Date.now },
     approvedBy: { type: String, default: null },
+    inviteLink: { type: String, default: null },
+    inviteLinkUpdatedAt: { type: Date, default: null },
+    inviteLinkByAccountId: { type: String, default: null },
   },
   { timestamps: true }
 );

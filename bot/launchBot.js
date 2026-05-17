@@ -4,6 +4,9 @@ export default function launchBot(bot) {
       .getMe()
       .then(info => {
         console.log(`✅ Bot @${info.username} connected`);
+        bot.telegram.setMyCommands([
+          { command: 'start', description: 'Open Sujini menu' },
+        ]).catch(() => {});
         bot.launch({ allowedUpdates: ['message', 'callback_query', 'chat_member', 'my_chat_member'] });
       })
       .catch(err => {
