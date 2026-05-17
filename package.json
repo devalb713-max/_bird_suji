@@ -1,0 +1,17 @@
+{
+  "type": "module",
+  "name": "mega-forwarder",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.1",
+    "express": "^5.2.1",
+    "mongoose": "^8.18.0",
+    "telegraf": "^4.16.3",
+    "telegram": "^2.26.22"
+  }
+}
