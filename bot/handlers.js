@@ -1946,11 +1946,10 @@ export async function handleAdminsMenu(ctx) {
 
 export async function handleAddAdmin(ctx) {
   setSession(ctx.from.id, { step: 'awaiting_admin_id', data: {} });
-  await safeEditMessageText(
-    '👑 *Add Admin*\n\nSend their Telegram user ID or @username:',
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'admins_menu')]]) }
-  );
-  await ctx.answerCbQuery();
+  await replyOrEdit(ctx, '👑 *Add Admin*\n\nSend their Telegram user ID or @username:', {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'admins_menu')]]),
+  });
 }
 
 export async function handleAdminIdInput(ctx) {
@@ -2075,7 +2074,8 @@ export async function handleAddAccount(ctx) {
   const cPreacher = map.preacher || 0;
   const cFinder = map.finder || 0;
   const cInviter = map.inviter || 0;
-  await safeEditMessageText(
+  await replyOrEdit(
+    ctx,
     '📱 *Add Account*\n\nSelect the account type:',
     {
       parse_mode: 'Markdown',
@@ -2088,7 +2088,6 @@ export async function handleAddAccount(ctx) {
       ]),
     }
   );
-  await ctx.answerCbQuery();
 }
 
 export async function handlePickAccountRole(ctx, role) {
@@ -2096,11 +2095,9 @@ export async function handlePickAccountRole(ctx, role) {
   session.data.role = role;
   session.step = 'awaiting_number';
   setSession(ctx.from.id, session);
-  await ctx.editMessageText(
-    'Send the phone number (with country code):\nExample: +1234567890',
-    { ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'back_to_main')]]) }
-  );
-  await ctx.answerCbQuery();
+  await replyOrEdit(ctx, 'Send the phone number (with country code):\nExample: +1234567890', {
+    ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'back_to_main')]]),
+  });
 }
 
 export async function handlePhoneNumber(ctx, session) {
@@ -2295,28 +2292,22 @@ async function _saveNewAccount(ctx, phoneNumber, client) {
 
 export async function handleTemplatesMenu(ctx) {
   const count = await MessageTemplate.countDocuments();
-  await safeEditMessageText(
-    `🧾 *Templates* (${count})`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('➕ Add Template', 'template_add')],
-        [Markup.button.callback('📋 View Templates', 'template_view')],
-        [Markup.button.callback('« Back', 'back_to_main')],
-      ]),
-    }
-  );
-  await ctx.answerCbQuery();
+  await replyOrEdit(ctx, `🧾 *Templates* (${count})`, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('➕ Add Template', 'template_add')],
+      [Markup.button.callback('📋 View Templates', 'template_view')],
+      [Markup.button.callback('« Back', 'back_to_main')],
+    ]),
+  });
 }
 
 export async function handleAddTemplate(ctx) {
   if (!(await requireAdmin(ctx))) return;
   setSession(ctx.from.id, { step: 'awaiting_template_text', data: {} });
-  await ctx.editMessageText(
-    'Send the template text:',
-    { ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'templates_menu')]]) }
-  );
-  await ctx.answerCbQuery();
+  await replyOrEdit(ctx, 'Send the template text:', {
+    ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'templates_menu')]]),
+  });
 }
 
 export async function handleTemplateTextInput(ctx) {
@@ -2330,13 +2321,16 @@ export async function handleTemplateTextInput(ctx) {
 export async function handleViewTemplates(ctx) {
   const templates = await MessageTemplate.find({}).sort({ createdAt: -1 }).limit(25);
   if (!templates.length) {
-    await ctx.editMessageText('No templates yet. Add one, then come back here to manage them.', Markup.inlineKeyboard([[Markup.button.callback('« Back', 'templates_menu')]]));
-    return ctx.answerCbQuery();
+    await replyOrEdit(
+      ctx,
+      'No templates yet. Add one, then come back here to manage them.',
+      Markup.inlineKeyboard([[Markup.button.callback('« Back', 'templates_menu')]])
+    );
+    return;
   }
   const buttons = templates.map(t => [Markup.button.callback(`🗑️ ${t.text.slice(0, 40) || '(empty)'}`, `del_tpl_${t._id}`)]);
   buttons.push([Markup.button.callback('« Back', 'templates_menu')]);
-  await ctx.editMessageText('Tap a template below to delete it:', Markup.inlineKeyboard(buttons));
-  await ctx.answerCbQuery();
+  await replyOrEdit(ctx, 'Tap a template below to delete it:', Markup.inlineKeyboard(buttons));
 }
 
 export async function handleDeleteTemplate(ctx, id) {
@@ -2349,27 +2343,23 @@ const KW_PAGE = 10;
 
 export async function handleKeywordsMenu(ctx) {
   const count = await Keyword.countDocuments();
-  await safeEditMessageText(
-    `🔑 *Keywords* (${count} total)`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('➕ Add Keywords', 'add_keywords')],
-        [Markup.button.callback('📋 View Keywords', 'view_keywords_0')],
-        [Markup.button.callback('« Back', 'back_to_main')],
-      ]),
-    }
-  );
-  await ctx.answerCbQuery();
+  await replyOrEdit(ctx, `🔑 *Keywords* (${count} total)`, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('➕ Add Keywords', 'add_keywords')],
+      [Markup.button.callback('📋 View Keywords', 'view_keywords_0')],
+      [Markup.button.callback('« Back', 'back_to_main')],
+    ]),
+  });
 }
 
 export async function handleAddKeywords(ctx) {
   setSession(ctx.from.id, { step: 'awaiting_keywords', data: {} });
-  await safeEditMessageText(
+  await replyOrEdit(
+    ctx,
     '➕ *Add Keywords*\n\nSend keywords separated by commas, or spaces if no commas:\nExample: `react, node, python`',
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'keywords_menu')]]) }
   );
-  await ctx.answerCbQuery();
 }
 
 export async function handleKeywordsInput(ctx) {
@@ -2400,11 +2390,11 @@ export async function handleViewKeywords(ctx, page = 0) {
   if (page < totalPages - 1) buttons.push([Markup.button.callback('Next ➡️', `view_keywords_${page + 1}`)]);
   buttons.push([Markup.button.callback('« Back', 'keywords_menu')]);
 
-  await safeEditMessageText(
+  await replyOrEdit(
+    ctx,
     `🔑 *Keywords* (page ${page + 1}/${totalPages}, total ${total})\n_Click a keyword to delete it_`,
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
   );
-  await ctx.answerCbQuery();
 }
 
 export async function handleDeleteKeyword(ctx, kwId) {
