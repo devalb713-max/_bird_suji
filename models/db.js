@@ -19,8 +19,20 @@ const accountSchema = new mongoose.Schema(
     groups: [{ id: String, name: String, link: String }],
     searchLimitHit: { type: Boolean, default: false },
     searchLimitResetsAt: { type: Date, default: null },
+    searchBotStartedAt: { type: Date, default: null },
     isJoining: { type: Boolean, default: false },
     isMessaging: { type: Boolean, default: false },
+    joiningLeaseId: { type: String, default: null },
+    joiningLeaseExpiresAt: { type: Date, default: null },
+    joiningLeaseUpdatedAt: { type: Date, default: null },
+    messagingLeaseId: { type: String, default: null },
+    messagingLeaseExpiresAt: { type: Date, default: null },
+    messagingLeaseUpdatedAt: { type: Date, default: null },
+    listenerConnectedAt: { type: Date, default: null },
+    listenerLastSeenAt: { type: Date, default: null },
+    listenerLastChatId: { type: String, default: null },
+    listenerLastMessageId: { type: Number, default: null },
+    listenerLastError: { type: String, default: null },
   },
   { timestamps: true }
 );
@@ -32,6 +44,10 @@ const keywordSchema = new mongoose.Schema(
     lockedByAccountId: { type: String, default: null },
     lockedAt: { type: Date, default: null },
     lockExpiresAt: { type: Date, default: null },
+    assignedToAccountId: { type: String, default: null, index: true },
+    assignedOrder: { type: Number, default: null, index: true },
+    lastProcessedAt: { type: Date, default: null, index: true },
+    lastProcessedByAccountId: { type: String, default: null },
   },
   { timestamps: true }
 );
@@ -75,6 +91,11 @@ const botSettingsSchema = new mongoose.Schema(
     aiAlertsEnabled: { type: Boolean, default: true },
     aiConsecutiveFails: { type: Number, default: 0 },
     aiCreditsAlertedAt: { type: Date, default: null },
+    listenerGroupsAnnouncedCount: { type: Number, default: 0 },
+    listenerGroupsAnnouncedAt: { type: Date, default: null },
+    membershipSweepLeaseId: { type: String, default: null },
+    membershipSweepLeaseExpiresAt: { type: Date, default: null },
+    membershipSweepLeaseUpdatedAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
@@ -91,19 +112,43 @@ const botUserSchema = new mongoose.Schema(
     mandatoryJoinedAt: { type: Date, default: null },
     joinPromptMessageId: { type: Number, default: null },
     joinPromptSentAt: { type: Date, default: null },
+    onboardingGraceUntil: { type: Date, default: null },
     trialStartedAt: { type: Date, default: null },
     trialEndsAt: { type: Date, default: null },
     subscriptionEndsAt: { type: Date, default: null },
     pendingSubscriptionPaidAt: { type: Date, default: null },
     pendingSubscriptionMonths: { type: Number, default: 0 },
+    pendingSujicardConfirmNonce: { type: String, default: null },
+    pendingSujicardConfirmExpiresAt: { type: Date, default: null },
+    lastSujicardConfirmNonce: { type: String, default: null },
+    lastSujicardConfirmAt: { type: Date, default: null },
     trialReminder8hSentAt: { type: Date, default: null },
     trialReminder2hSentAt: { type: Date, default: null },
     expiryReminder3dSentAt: { type: Date, default: null },
+    expiryReminder1dSentAt: { type: Date, default: null },
     removedAt: { type: Date, default: null },
+    sujicardBalance: { type: Number, default: 0, index: true },
+    referredByUserId: { type: String, default: null, index: true },
+    referredAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
 export const BotUser = mongoose.model('BotUser', botUserSchema);
+
+const referralSchema = new mongoose.Schema(
+  {
+    referrerUserId: { type: String, required: true, index: true },
+    referrerUsername: { type: String, default: null },
+    referredUserId: { type: String, required: true, unique: true, index: true },
+    referredUsername: { type: String, default: null },
+    status: { type: String, enum: ['pending', 'credited', 'invalidated'], default: 'pending', index: true },
+    clickedAt: { type: Date, default: Date.now, index: true },
+    creditedAt: { type: Date, default: null },
+  },
+  { timestamps: true }
+);
+referralSchema.index({ referrerUserId: 1, status: 1, createdAt: -1 });
+export const Referral = mongoose.model('Referral', referralSchema);
 
 const paymentSchema = new mongoose.Schema(
   {
@@ -177,6 +222,7 @@ const aiQueueMessageSchema = new mongoose.Schema(
     senderName: { type: String, default: null },
     senderUsername: { type: String, default: null },
     senderId: { type: String, default: null },
+    groupId: { type: String, default: null },
     groupLink: { type: String, default: null },
     messageLink: { type: String, default: null },
 
@@ -200,6 +246,7 @@ const queuedPostSchema = new mongoose.Schema(
     senderName: { type: String, default: null },
     senderUsername: { type: String, default: null },
     senderId: { type: String, default: null },
+    groupId: { type: String, default: null },
     groupName: { type: String, default: null },
     groupLink: { type: String, default: null },
     messageLink: { type: String, default: null },
@@ -207,6 +254,18 @@ const queuedPostSchema = new mongoose.Schema(
   { timestamps: true }
 );
 export const QueuedPost = mongoose.model('QueuedPost', queuedPostSchema);
+
+const postDedupeSchema = new mongoose.Schema(
+  {
+    key: { type: String, required: true, unique: true, index: true },
+    sourceChatId: { type: String, default: null, index: true },
+    sourceMessageId: { type: Number, default: null, index: true },
+    targetChatId: { type: String, default: null, index: true },
+  },
+  { timestamps: true }
+);
+postDedupeSchema.index({ createdAt: 1 }, { expireAfterSeconds: 90 * 24 * 60 * 60 });
+export const PostDedupe = mongoose.model('PostDedupe', postDedupeSchema);
 
 export async function connectDB() {
   mongoose.set('runValidators', true);

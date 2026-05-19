@@ -1,9 +1,11 @@
 import "dotenv/config";
+
 import { Telegraf } from "telegraf";
 import {
   connectDB,
   Account,
   Admin,
+  Keyword,
   ApprovedChat,
   BotChat,
   BotSettings,
@@ -502,6 +504,7 @@ async function connectWithRetry() {
 }
 
 await connectWithRetry();
+
 await seedOnStartup();
 setupHandlers(bot);
 launchBot(bot);

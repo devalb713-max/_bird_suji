@@ -1,4 +1,5 @@
 import { Markup } from 'telegraf';
+import { randomBytes } from 'node:crypto';
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { Api } from 'telegram/tl/index.js';
@@ -11,6 +12,7 @@ import {
   ApprovedChat,
   BotSettings,
   BotUser,
+  Referral,
   Payment,
   InviteTicket,
   MessageTemplate,
@@ -19,8 +21,8 @@ import {
 } from '../models/db.js';
 import { sendCodeWithRetry } from '../helpers/telegram.js';
 import { randomFingerprint } from '../helpers/fingerprint.js';
-import { startJoinWorker, stopJoinWorker, isJoinWorkerRunning, startPoller } from '../workers/joinWorker.js';
-import { startMessageWorker, stopMessageWorker, isMessageWorkerRunning } from '../workers/messageWorker.js';
+import { startJoinWorker, stopJoinWorker, isJoinWorkerRunning, isAnyJoinWorkerRunning, startPoller } from '../workers/joinWorker.js';
+import { startMessageWorker, stopMessageWorker, isMessageWorkerRunning, isAnyMessageWorkerRunning } from '../workers/messageWorker.js';
 import { SEED_KEYWORDS } from '../models/keywords.js';
 
 export async function isAdmin(userId, username) {
@@ -48,7 +50,8 @@ const BILLING = (() => {
   const trialReminder8hMsBeforeEnd = testMode ? 6 * 60 * 1000 : 8 * 60 * 60 * 1000;
   const trialReminder2hMsBeforeEnd = testMode ? 2 * 60 * 1000 : 2 * 60 * 60 * 1000;
   const subReminder3dMsBeforeEnd = testMode ? 10 * 60 * 1000 : 3 * 24 * 60 * 60 * 1000;
-  return { testMode, trialMs, monthMs, trialReminder8hMsBeforeEnd, trialReminder2hMsBeforeEnd, subReminder3dMsBeforeEnd };
+  const subReminder1dMsBeforeEnd = testMode ? 4 * 60 * 1000 : 24 * 60 * 60 * 1000;
+  return { testMode, trialMs, monthMs, trialReminder8hMsBeforeEnd, trialReminder2hMsBeforeEnd, subReminder3dMsBeforeEnd, subReminder1dMsBeforeEnd };
 })();
 
 const adminCache = {
@@ -111,6 +114,20 @@ function describeTelegramError(err) {
   return { code, desc, retryAfter };
 }
 
+function isStaleCallbackQueryError(err) {
+  const { code, desc } = describeTelegramError(err);
+  if (Number(code) !== 400) return false;
+  const d = (desc || '').toString().toLowerCase();
+  return d.includes('query is too old') || d.includes('response timeout expired') || d.includes('query id is invalid');
+}
+
+function isMessageNotModifiedError(err) {
+  const { code, desc } = describeTelegramError(err);
+  if (Number(code) !== 400) return false;
+  const d = (desc || '').toString().toLowerCase();
+  return d.includes('message is not modified');
+}
+
 function isServiceSpamMessage(msg) {
   if (!msg) return false;
   return !!(
@@ -138,6 +155,79 @@ function isServiceSpamMessage(msg) {
   );
 }
 
+const recentGateRuns = new Map();
+
+async function computeUserAccessState(settings, telegram, userIdStr) {
+  const userId = userIdStr?.toString?.() || '';
+  if (!userId) return { exists: false, active: false, banned: false, user: null };
+
+  const existing = await BotUser.findOne({ userId }).lean();
+  if (!existing) return { exists: false, active: false, banned: false, user: null };
+  if (existing.bannedAt) return { exists: true, active: false, banned: true, user: existing };
+
+  if ((existing.pendingSubscriptionMonths || 0) > 0) {
+    await tryActivatePendingSubscription(settings, telegram, userId).catch(() => {});
+  }
+
+  if (!existing.mandatoryJoinedAt && existing.joinPromptMessageId) {
+    await finalizeOnboardingIfJoined(settings, telegram, userId).catch(() => {});
+  }
+
+  const user = await BotUser.findOne({ userId }).lean();
+  if (!user) return { exists: false, active: false, banned: false, user: null };
+  if (user.bannedAt) return { exists: true, active: false, banned: true, user };
+
+  const now = Date.now();
+  const trialOk = user?.trialEndsAt && now < new Date(user.trialEndsAt).getTime();
+  const subOk = user?.subscriptionEndsAt && now < new Date(user.subscriptionEndsAt).getTime();
+  const pendingOk = (user?.pendingSubscriptionMonths || 0) > 0;
+  const active = !!(trialOk || subOk || pendingOk);
+
+  return { exists: true, active, banned: false, user };
+}
+
+async function enforceMandatoryJoinGate(settings, telegram, chatId, joinedUser, context = '') {
+  const chatIdStr = chatId?.toString?.() || null;
+  if (!chatIdStr) return false;
+
+  const nowMs = Date.now();
+  const debounceKey = `${chatIdStr}:${joinedUser?.id || ''}`;
+  if (debounceKey) {
+    const last = recentGateRuns.get(debounceKey) || 0;
+    if (nowMs - last < 12_000) return false;
+    recentGateRuns.set(debounceKey, nowMs);
+    if (recentGateRuns.size > 5000) {
+      for (const [k, t] of recentGateRuns) {
+        if (nowMs - t > 60_000) recentGateRuns.delete(k);
+      }
+    }
+  }
+
+  const enforceIds = (await getMandatoryChatIds()).filter(Boolean).map(String);
+  if (!enforceIds.includes(chatIdStr)) return false;
+
+  const userId = joinedUser?.id;
+  if (!userId) return false;
+  if (await isAdmin(userId, joinedUser?.username)) return false;
+
+  const state = await computeUserAccessState(settings, telegram, userId.toString());
+  if (!state.exists) {
+    await removeUserFromChat(telegram, chatIdStr, userId, `${context || 'gate'}_no_record`);
+    return true;
+  }
+  if (state.banned) {
+    await removeUserFromChat(telegram, chatIdStr, userId, `${context || 'gate'}_banned`);
+    return true;
+  }
+  if (state.active) return false;
+
+  const graceUntil = state?.user?.onboardingGraceUntil ? new Date(state.user.onboardingGraceUntil).getTime() : 0;
+  if (graceUntil && Date.now() < graceUntil) return false;
+
+  await removeUserFromChat(telegram, chatIdStr, userId, `${context || 'gate'}_inactive`);
+  return true;
+}
+
 async function safeSendMessage(telegram, chatId, text, extra = null, context = '') {
   try {
     await telegram.sendMessage(chatId, text, extra || {});
@@ -160,10 +250,35 @@ async function notifyAdmins(telegram, text, context = 'admin_notice') {
 function pay100Keyboard() {
   return {
     reply_markup: {
-      inline_keyboard: [[{ text: '💳 Pay 100 Stars', callback_data: 'subscribe_100' }]],
+      inline_keyboard: [
+        [
+          { text: '🪙 Pay 100 Sujicards', callback_data: 'subscribe_cards' },
+          { text: '💳 Pay 100 Stars', callback_data: 'subscribe_100' },
+        ],
+      ],
     },
   };
 }
+
+function sujicardConfirmKeyboard(nonce, cost) {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: `✅ Confirm ${cost} Sujicards`, callback_data: `subscribe_cards_confirm_${nonce}` }],
+        [{ text: '❌ Cancel', callback_data: `subscribe_cards_cancel_${nonce}` }],
+      ],
+    },
+  };
+}
+
+function newNonce() {
+  return randomBytes(6).toString('hex');
+}
+
+const SUJICARDS = {
+  perReferral: 1,
+  monthlySubCost: 100,
+};
 
 async function safeDeleteMessage(telegram, chatId, messageId, context = '') {
   if (!chatId || !messageId) return false;
@@ -259,13 +374,96 @@ function getSession(userId) { return userSessions.get(userId.toString()); }
 function setSession(userId, data) { userSessions.set(userId.toString(), data); }
 function clearSession(userId) { userSessions.delete(userId.toString()); }
 
+const MEMBERSHIP_SWEEP_LEASE_ID = `membership_sweep:${process.pid}:${randomBytes(6).toString('hex')}`;
+const MEMBERSHIP_SWEEP_LEASE_MS = 2 * 60 * 1000;
+
 async function getSettings() {
   const existing = await BotSettings.findOne({});
   if (existing) return existing;
   return BotSettings.create({});
 }
 
+let _listenerGroupsAnnounceRunning = false;
+
+function formatCompactCount(n) {
+  const value = Number(n || 0);
+  if (!Number.isFinite(value) || value <= 0) return '0';
+  if (value >= 100000) return Math.trunc(value).toLocaleString('en-US');
+  if (value < 1000) return Math.trunc(value).toString();
+  const k = value / 1000;
+  const fixed = k < 10 ? k.toFixed(1) : k.toFixed(1);
+  const trimmed = fixed.endsWith('.0') ? fixed.slice(0, -2) : fixed;
+  return `${trimmed}k`;
+}
+
+function normalizeLinkKey(link) {
+  try {
+    const u = new URL(link);
+    return `https://t.me/${u.pathname.replace(/^\//, '').toLowerCase()}`;
+  } catch {
+    return (link || '').toString().toLowerCase().trim();
+  }
+}
+
+async function getAnnouncementTargetChatIds() {
+  const s = await getSettings();
+  const channelId = s?.requiredChannelId ? Number(s.requiredChannelId) : null;
+  if (channelId && Number.isFinite(channelId)) return [channelId];
+
+  const configured = s?.jobsTargetChatId ? Number(s.jobsTargetChatId) : null;
+  if (configured && Number.isFinite(configured)) return [configured];
+
+  return [];
+}
+
+async function announceListenerGroupsProgress(telegram) {
+  if (_listenerGroupsAnnounceRunning) return;
+  _listenerGroupsAnnounceRunning = true;
+  try {
+    const settings = await getSettings();
+    if (!settings?.botPostingEnabled) return;
+
+    const accounts = await Account.find({ role: 'listener', session: { $nin: [null, ''] } }, 'groups').lean();
+    const keys = new Set();
+    for (const acc of accounts) {
+      for (const g of acc.groups || []) {
+        const idKey = (g?.id || '').toString().trim();
+        if (idKey) keys.add(`id:${idKey}`);
+        const linkKey = normalizeLinkKey(g?.link || '');
+        if (linkKey) keys.add(`link:${linkKey}`);
+      }
+    }
+    const count = keys.size;
+    if (count <= 40) return;
+
+    const lastCount = Number(settings.listenerGroupsAnnouncedCount || 0);
+    if (count <= lastCount) return;
+
+    const targets = await getAnnouncementTargetChatIds();
+    if (!targets.length) return;
+
+    const pretty = formatCompactCount(count);
+    const msg =
+      `🔥🦅 Sujini has joined ${pretty} groups so far.\n\n` +
+      `I’ll keep fetching gigs for y’all.`;
+
+    const results = await Promise.allSettled(
+      targets.map((chatId) => telegram.sendMessage(chatId, msg, { disable_web_page_preview: true }))
+    );
+    const sentAny = results.some((r) => r.status === 'fulfilled');
+    if (sentAny) {
+      await BotSettings.updateOne(
+        { _id: settings._id },
+        { $set: { listenerGroupsAnnouncedCount: count, listenerGroupsAnnouncedAt: new Date() } }
+      ).catch(() => {});
+    }
+  } finally {
+    _listenerGroupsAnnounceRunning = false;
+  }
+}
+
 function mainMenu() {
+  const anyRunning = isAnyJoinWorkerRunning() || isAnyMessageWorkerRunning();
   return Markup.inlineKeyboard([
     [Markup.button.callback('📋 Accounts', 'accounts')],
     [Markup.button.callback('➕ Add Account', 'add_account')],
@@ -277,8 +475,7 @@ function mainMenu() {
     [Markup.button.callback('� Broadcast', 'broadcast_menu')],
     [Markup.button.callback('⚙️ Settings', 'settings_menu')],
     [Markup.button.callback('👑 Admins', 'admins_menu')],
-    [Markup.button.callback('▶️ Start All', 'start_all')],
-    [Markup.button.callback('⏹️ Stop All', 'stop_all')],
+    [Markup.button.callback(anyRunning ? '🔴 Stop All' : '🟢 Start All', 'toggle_all')],
   ]);
 }
 
@@ -475,6 +672,37 @@ export async function handleStart(ctx) {
   }
 }
 
+function getStartPayload(ctx) {
+  const sp = ctx?.startPayload;
+  if (sp != null && sp !== '') return sp.toString().trim() || null;
+  const text = (ctx?.message?.text || '').toString();
+  const m = text.match(/^\/start(?:@\w+)?(?:\s+([\s\S]+))?$/i);
+  return (m?.[1] || '').toString().trim() || null;
+}
+
+function parseReferralOwnerUserId(payload) {
+  const m = payload ? payload.toString().trim().match(/^ref_(\d+)$/i) : null;
+  return m?.[1] ? m[1].toString() : null;
+}
+
+let _botPublicUsername = null;
+async function getBotPublicUsername(telegram) {
+  if (_botPublicUsername) return _botPublicUsername;
+  const me = await telegram.getMe().catch(() => null);
+  const u = me?.username ? me.username.toString() : null;
+  _botPublicUsername = u;
+  return u;
+}
+
+async function getReferralCount(userId) {
+  const id = userId.toString();
+  return Referral.countDocuments({ referrerUserId: id, status: { $in: ['pending', 'credited'] } });
+}
+
+function isDuplicateKeyError(err) {
+  return err?.code === 11000 || (err?.message || '').toString().includes('E11000 duplicate key error');
+}
+
 async function ensureBotUser(ctx) {
   const userId = ctx.from.id.toString();
   const username = ctx.from.username ? '@' + ctx.from.username.replace(/^@/, '') : null;
@@ -482,12 +710,58 @@ async function ensureBotUser(ctx) {
   let user = await BotUser.findOne({ userId });
   if (!user) {
     isNew = true;
-    user = await BotUser.create({
-      userId,
-      username,
-      trialStartedAt: new Date(),
-      trialEndsAt: new Date(Date.now() + BILLING.trialMs),
-    });
+    const startPayload = getStartPayload(ctx);
+    const ownerId = parseReferralOwnerUserId(startPayload);
+    let referredByUserId = null;
+    let referredAt = null;
+    let ownerDoc = null;
+
+    if (ownerId && ownerId !== userId) {
+      ownerDoc = await BotUser.findOne({ userId: ownerId }).lean();
+      if (ownerDoc) {
+        referredByUserId = ownerId;
+        referredAt = new Date();
+      }
+    }
+
+    try {
+      user = await BotUser.create({
+        userId,
+        username,
+        trialStartedAt: new Date(),
+        trialEndsAt: new Date(Date.now() + BILLING.trialMs),
+        referredByUserId,
+        referredAt,
+      });
+    } catch (err) {
+      if (!isDuplicateKeyError(err)) throw err;
+      isNew = false;
+      user = await BotUser.findOne({ userId });
+      if (username && user?.username !== username) {
+        await BotUser.updateOne({ userId }, { $set: { username } }).catch(() => {});
+      }
+      return { user, isNew };
+    }
+
+    if (referredByUserId && ownerDoc) {
+      await Referral.create({
+        referrerUserId: referredByUserId,
+        referrerUsername: ownerDoc.username || null,
+        referredUserId: userId,
+        referredUsername: username || null,
+        status: 'pending',
+        clickedAt: new Date(),
+      }).catch(() => {});
+
+      const who = username || userId;
+      await safeSendMessage(
+        ctx.telegram,
+        referredByUserId,
+        `🔥🦅 Referral: ${who} (+${SUJICARDS.perReferral} when they join)`,
+        null,
+        'referral_click_notify'
+      );
+    }
   } else if (username && user.username !== username) {
     await BotUser.updateOne({ _id: user._id }, { $set: { username } });
   }
@@ -715,8 +989,16 @@ async function ensureApprovedChatInviteLink(settings, chatIdStr) {
   const chatId = chatIdStr?.toString?.() || null;
   if (!chatId) return null;
 
-  const approved = await ApprovedChat.findOne({ chatId }).lean();
-  if (!approved) return null;
+  const requiredChannelId = settings?.requiredChannelId?.toString?.() || null;
+  const requiredGroupId = settings?.requiredGroupId?.toString?.() || null;
+  if (requiredChannelId && chatId === requiredChannelId && settings?.requiredChannelInviteLink) {
+    return settings.requiredChannelInviteLink;
+  }
+  if (requiredGroupId && chatId === requiredGroupId && settings?.requiredGroupInviteLink) {
+    return settings.requiredGroupInviteLink;
+  }
+
+  const approved = await ApprovedChat.findOne({ chatId }).lean().catch(() => null);
 
   if (approved?.inviteLink) return approved.inviteLink;
 
@@ -724,10 +1006,16 @@ async function ensureApprovedChatInviteLink(settings, chatIdStr) {
   const uname = normalizeUsername(botChat?.username || '');
   if (uname) {
     const link = `https://t.me/${uname}`;
-    await ApprovedChat.updateOne(
-      { chatId },
-      { $set: { inviteLink: link, inviteLinkUpdatedAt: new Date(), inviteLinkByAccountId: null } }
-    ).catch(() => {});
+    if (approved?._id) {
+      await ApprovedChat.updateOne(
+        { chatId },
+        { $set: { inviteLink: link, inviteLinkUpdatedAt: new Date(), inviteLinkByAccountId: null } }
+      ).catch(() => {});
+    } else if (requiredChannelId && chatId === requiredChannelId) {
+      await BotSettings.updateOne({ _id: settings._id }, { $set: { requiredChannelInviteLink: link } }).catch(() => {});
+    } else if (requiredGroupId && chatId === requiredGroupId) {
+      await BotSettings.updateOne({ _id: settings._id }, { $set: { requiredGroupInviteLink: link } }).catch(() => {});
+    }
     return link;
   }
 
@@ -737,12 +1025,23 @@ async function ensureApprovedChatInviteLink(settings, chatIdStr) {
   for (let i = 0; i < inviters.length; i += 1) {
     const inviter = pickInviterAccount(inviters);
     try {
-      const link = await createSingleUseInviteLink(inviter, chatId, '', `sujini:${approved.type}:${chatId}`);
+      const inferredType =
+        approved?.type ||
+        (requiredChannelId && chatId === requiredChannelId ? 'channel' : null) ||
+        (requiredGroupId && chatId === requiredGroupId ? 'group' : null) ||
+        'chat';
+      const link = await createSingleUseInviteLink(inviter, chatId, '', `sujini:${inferredType}:${chatId}`);
       if (!link) continue;
-      await ApprovedChat.updateOne(
-        { chatId },
-        { $set: { inviteLink: link, inviteLinkUpdatedAt: new Date(), inviteLinkByAccountId: inviter?._id?.toString?.() || null } }
-      ).catch(() => {});
+      if (approved?._id) {
+        await ApprovedChat.updateOne(
+          { chatId },
+          { $set: { inviteLink: link, inviteLinkUpdatedAt: new Date(), inviteLinkByAccountId: inviter?._id?.toString?.() || null } }
+        ).catch(() => {});
+      } else if (requiredChannelId && chatId === requiredChannelId) {
+        await BotSettings.updateOne({ _id: settings._id }, { $set: { requiredChannelInviteLink: link } }).catch(() => {});
+      } else if (requiredGroupId && chatId === requiredGroupId) {
+        await BotSettings.updateOne({ _id: settings._id }, { $set: { requiredGroupInviteLink: link } }).catch(() => {});
+      }
       return link;
     } catch {}
   }
@@ -870,6 +1169,44 @@ function formatHumanTimeLeft(msLeft) {
   return days === 1 ? 'about 1 day' : `about ${days} days`;
 }
 
+function formatTrialTimeLeft(msLeft) {
+  const ms = Math.max(0, Number(msLeft) || 0);
+  const minutes = Math.ceil(ms / 60000);
+  if (minutes <= 1) return '1 minute';
+  if (minutes < 60) return `${minutes} minutes`;
+  const hours = Math.ceil(minutes / 60);
+  if (hours === 1) return '1 hour';
+  if (hours < 24) return `${hours} hours`;
+  const days = Math.ceil(hours / 24);
+  return days === 1 ? '1 day' : `${days} days`;
+}
+
+async function acquireMembershipSweepLease(settings) {
+  const now = new Date();
+  const expiresAt = new Date(Date.now() + MEMBERSHIP_SWEEP_LEASE_MS);
+  const res = await BotSettings.updateOne(
+    {
+      _id: settings._id,
+      $or: [
+        { membershipSweepLeaseExpiresAt: null },
+        { membershipSweepLeaseExpiresAt: { $lt: now } },
+        { membershipSweepLeaseId: MEMBERSHIP_SWEEP_LEASE_ID },
+      ],
+    },
+    { $set: { membershipSweepLeaseId: MEMBERSHIP_SWEEP_LEASE_ID, membershipSweepLeaseExpiresAt: expiresAt, membershipSweepLeaseUpdatedAt: now } }
+  ).catch(() => null);
+  return !!(res && (res.modifiedCount === 1 || res.nModified === 1 || res.matchedCount === 1));
+}
+
+async function renewMembershipSweepLease(settings) {
+  const now = new Date();
+  const expiresAt = new Date(Date.now() + MEMBERSHIP_SWEEP_LEASE_MS);
+  await BotSettings.updateOne(
+    { _id: settings._id, membershipSweepLeaseId: MEMBERSHIP_SWEEP_LEASE_ID },
+    { $set: { membershipSweepLeaseExpiresAt: expiresAt, membershipSweepLeaseUpdatedAt: now } }
+  ).catch(() => {});
+}
+
 async function isUserFacingOperational(settings) {
   const [inviters, [channels, groups]] = await Promise.all([
     getInviterAccounts(settings),
@@ -878,6 +1215,142 @@ async function isUserFacingOperational(settings) {
 
   if ((channels?.length || 0) + (groups?.length || 0) < 1) return false;
   if ((inviters?.length || 0) < 1) return false;
+  return true;
+}
+
+async function tryUnbanWithInviter(settings, chatIdStr, userIdStr) {
+  const inviters = await getInviterAccounts(settings);
+  if (!inviters.length) return false;
+  const hints = await getChatLinkHintsByIds([chatIdStr]);
+  const hint = hints.get(chatIdStr.toString()) || '';
+  const uid = userIdStr?.toString?.() || '';
+  if (!uid) return false;
+
+  const rights = new Api.ChatBannedRights({
+    untilDate: 0,
+    viewMessages: false,
+    sendMessages: false,
+    sendMedia: false,
+    sendStickers: false,
+    sendGifs: false,
+    sendGames: false,
+    sendInline: false,
+    embedLinks: false,
+    sendPolls: false,
+    changeInfo: false,
+    inviteUsers: false,
+    pinMessages: false,
+    manageTopics: false,
+  });
+
+  for (let i = 0; i < inviters.length; i += 1) {
+    const inviter = pickInviterAccount(inviters);
+    try {
+      const ok = await withInviterClient(inviter, async (client) => {
+        const peer = await resolveInviterPeer(client, chatIdStr.toString(), hint);
+        const user = await client.getEntity(uid).catch(() => null);
+        if (!user) return false;
+        await client.invoke(new Api.channels.EditBanned({ channel: peer, participant: user, bannedRights: rights }));
+        return true;
+      });
+      if (ok) return true;
+    } catch {}
+  }
+  return false;
+}
+
+async function ensureUserUnbannedInChats(settings, telegram, userId, chatIds) {
+  const uid = userId?.toString?.() || '';
+  const ids = (chatIds || []).map((c) => c?.toString?.()).filter(Boolean);
+  if (!uid || !ids.length) return;
+  for (const cid of ids) {
+    const ok = await telegram.unbanChatMember(Number(cid), Number(uid)).then(() => true).catch(() => false);
+    if (ok) continue;
+    await tryUnbanWithInviter(settings, cid, uid).catch(() => {});
+  }
+}
+
+function isAdminRightsError(desc = '') {
+  const d = (desc || '').toString().toLowerCase();
+  return d.includes('not enough rights') ||
+    d.includes('chat_admin_required') ||
+    d.includes('need administrator rights');
+}
+
+async function tryKickWithInviter(settings, chatIdStr, userIdStr, untilDateSec, unbanAfter = true) {
+  const inviters = await getInviterAccounts(settings);
+  if (!inviters.length) return false;
+  const hints = await getChatLinkHintsByIds([chatIdStr]);
+  const hint = hints.get(chatIdStr.toString()) || '';
+  const uid = userIdStr?.toString?.() || '';
+  if (!uid) return false;
+
+  const banRights = new Api.ChatBannedRights({
+    untilDate: untilDateSec || 0,
+    viewMessages: true,
+    sendMessages: true,
+    sendMedia: true,
+    sendStickers: true,
+    sendGifs: true,
+    sendGames: true,
+    sendInline: true,
+    embedLinks: true,
+    sendPolls: true,
+    changeInfo: true,
+    inviteUsers: true,
+    pinMessages: true,
+    manageTopics: true,
+  });
+
+  const unbanRights = new Api.ChatBannedRights({
+    untilDate: 0,
+    viewMessages: false,
+    sendMessages: false,
+    sendMedia: false,
+    sendStickers: false,
+    sendGifs: false,
+    sendGames: false,
+    sendInline: false,
+    embedLinks: false,
+    sendPolls: false,
+    changeInfo: false,
+    inviteUsers: false,
+    pinMessages: false,
+    manageTopics: false,
+  });
+
+  for (let i = 0; i < inviters.length; i += 1) {
+    const inviter = pickInviterAccount(inviters);
+    try {
+      const ok = await withInviterClient(inviter, async (client) => {
+        const peer = await resolveInviterPeer(client, chatIdStr.toString(), hint);
+        const user = await client.getEntity(uid).catch(() => null);
+        if (!user) return false;
+        await client.invoke(new Api.channels.EditBanned({ channel: peer, participant: user, bannedRights: banRights }));
+        if (unbanAfter) {
+          await client.invoke(new Api.channels.EditBanned({ channel: peer, participant: user, bannedRights: unbanRights })).catch(() => {});
+        }
+        return true;
+      });
+      if (ok) return true;
+    } catch {}
+  }
+  return false;
+}
+
+const USER_COMMAND_GATE_TEXT = 'You must start the bot and have an active subscription/trial to stay in the community.';
+
+async function hasAllMandatoryMembershipForUser(telegram, userId) {
+  const uid = Number(userId);
+  if (!Number.isFinite(uid)) return false;
+  const channelIds = (await getMandatoryChannelIds()).map((id) => Number(id)).filter((n) => Number.isFinite(n));
+  const groupIds = (await getMandatoryGroupIds()).map((id) => Number(id)).filter((n) => Number.isFinite(n));
+  for (const cid of channelIds) {
+    if (!(await isMember(telegram, cid, uid))) return false;
+  }
+  for (const gid of groupIds) {
+    if (!(await isMember(telegram, gid, uid))) return false;
+  }
   return true;
 }
 
@@ -896,7 +1369,28 @@ async function sendJoinPromptIfNeeded(ctx, settings, userDoc, missing = null) {
   const neededGroupIds = needs
     ? Array.from(new Set(needs.filter(m => m?.kind === 'group').map(m => m?.chatId?.toString?.()).filter(Boolean)))
     : (firstGroupId ? [firstGroupId] : []);
-  const chatIdsForLinks = [...neededChannelIds, ...neededGroupIds].filter(Boolean);
+  const uid = Number(ctx.from?.id);
+  const stillNeededChannelIds = [];
+  const stillNeededGroupIds = [];
+  for (const cid of neededChannelIds) {
+    const n = Number(cid);
+    if (!Number.isFinite(n)) continue;
+    const ok = await isMember(ctx.telegram, n, uid);
+    if (!ok) stillNeededChannelIds.push(cid);
+  }
+  for (const gid of neededGroupIds) {
+    const n = Number(gid);
+    if (!Number.isFinite(n)) continue;
+    const ok = await isMember(ctx.telegram, n, uid);
+    if (!ok) stillNeededGroupIds.push(gid);
+  }
+  if (!stillNeededChannelIds.length && !stillNeededGroupIds.length) {
+    await finalizeOnboardingIfJoined(settings, ctx.telegram, ctx.from.id.toString()).catch(() => {});
+    return true;
+  }
+  const chatIdsForLinks = [...stillNeededChannelIds, ...stillNeededGroupIds].filter(Boolean);
+
+  await ensureUserUnbannedInChats(settings, ctx.telegram, ctx.from.id, chatIdsForLinks);
 
   if (userDoc?.joinPromptMessageId) {
     const sentAt = userDoc?.joinPromptSentAt ? new Date(userDoc.joinPromptSentAt).getTime() : 0;
@@ -909,15 +1403,15 @@ async function sendJoinPromptIfNeeded(ctx, settings, userDoc, missing = null) {
           { chatIds: chatIdsForLinks.length ? chatIdsForLinks : [firstChannelId, firstGroupId].filter(Boolean) }
         );
         const rows = [];
-        for (let i = 0; i < neededGroupIds.length; i += 1) {
-          const id = neededGroupIds[i];
+        for (let i = 0; i < stillNeededGroupIds.length; i += 1) {
+          const id = stillNeededGroupIds[i];
           const link = invites.groups?.[id] || null;
-          if (link) rows.push([Markup.button.url(neededGroupIds.length > 1 ? `Join Group ${i + 1}` : 'Join Group', link)]);
+          if (link) rows.push([Markup.button.url(stillNeededGroupIds.length > 1 ? `Join Group ${i + 1}` : 'Join Group', link)]);
         }
-        for (let i = 0; i < neededChannelIds.length; i += 1) {
-          const id = neededChannelIds[i];
+        for (let i = 0; i < stillNeededChannelIds.length; i += 1) {
+          const id = stillNeededChannelIds[i];
           const link = invites.channels?.[id] || null;
-          if (link) rows.push([Markup.button.url(neededChannelIds.length > 1 ? `Join Channel ${i + 1}` : 'Join Channel', link)]);
+          if (link) rows.push([Markup.button.url(stillNeededChannelIds.length > 1 ? `Join Channel ${i + 1}` : 'Join Channel', link)]);
         }
         if (rows.length) {
           const text =
@@ -934,7 +1428,7 @@ async function sendJoinPromptIfNeeded(ctx, settings, userDoc, missing = null) {
           if (ok) {
             await BotUser.updateOne(
               { _id: userDoc._id },
-              { $set: { joinPromptSentAt: new Date() } }
+              { $set: { joinPromptSentAt: new Date(), onboardingGraceUntil: new Date(Date.now() + 30 * 60 * 1000) } }
             ).catch(() => {});
             return true;
           }
@@ -953,7 +1447,7 @@ async function sendJoinPromptIfNeeded(ctx, settings, userDoc, missing = null) {
 
   await BotUser.updateOne(
     { _id: userDoc._id },
-    { $set: { joinPromptMessageId: placeholder.message_id, joinPromptSentAt: new Date(), mandatoryJoinedAt: null } }
+    { $set: { joinPromptMessageId: placeholder.message_id, joinPromptSentAt: new Date(), onboardingGraceUntil: new Date(Date.now() + 30 * 60 * 1000), mandatoryJoinedAt: null } }
   ).catch(() => {});
 
   const invites = await ensureUserInviteTickets(
@@ -963,15 +1457,15 @@ async function sendJoinPromptIfNeeded(ctx, settings, userDoc, missing = null) {
   );
 
   const rows = [];
-  for (let i = 0; i < neededGroupIds.length; i += 1) {
-    const id = neededGroupIds[i];
+  for (let i = 0; i < stillNeededGroupIds.length; i += 1) {
+    const id = stillNeededGroupIds[i];
     const link = invites.groups?.[id] || null;
-    if (link) rows.push([Markup.button.url(neededGroupIds.length > 1 ? `Join Group ${i + 1}` : 'Join Group', link)]);
+    if (link) rows.push([Markup.button.url(stillNeededGroupIds.length > 1 ? `Join Group ${i + 1}` : 'Join Group', link)]);
   }
-  for (let i = 0; i < neededChannelIds.length; i += 1) {
-    const id = neededChannelIds[i];
+  for (let i = 0; i < stillNeededChannelIds.length; i += 1) {
+    const id = stillNeededChannelIds[i];
     const link = invites.channels?.[id] || null;
-    if (link) rows.push([Markup.button.url(neededChannelIds.length > 1 ? `Join Channel ${i + 1}` : 'Join Channel', link)]);
+    if (link) rows.push([Markup.button.url(stillNeededChannelIds.length > 1 ? `Join Channel ${i + 1}` : 'Join Channel', link)]);
   }
   if (!rows.length) {
     await ctx.telegram.editMessageText(ctx.chat.id, placeholder.message_id, undefined, 'Join links are temporarily unavailable. Please try /start again in a few minutes.', { disable_web_page_preview: true }).catch(() => {});
@@ -994,7 +1488,7 @@ async function sendJoinPromptIfNeeded(ctx, settings, userDoc, missing = null) {
     if (sent?.message_id) {
       await BotUser.updateOne(
         { _id: userDoc._id },
-        { $set: { joinPromptMessageId: sent.message_id, joinPromptSentAt: new Date(), mandatoryJoinedAt: null } }
+        { $set: { joinPromptMessageId: sent.message_id, joinPromptSentAt: new Date(), onboardingGraceUntil: new Date(Date.now() + 30 * 60 * 1000), mandatoryJoinedAt: null } }
       ).catch(() => {});
     }
   });
@@ -1022,10 +1516,14 @@ async function finalizeOnboardingIfJoined(settings, telegram, userIdStr) {
     await safeDeleteMessage(telegram, Number(userId), u.joinPromptMessageId, 'delete_join_prompt');
   }
 
-  await BotUser.updateOne(
-    { userId },
-    { $set: { mandatoryJoinedAt: new Date(), joinPromptMessageId: null, joinPromptSentAt: null } }
-  ).catch(() => {});
+  const res = await BotUser.updateOne(
+    { userId, mandatoryJoinedAt: null },
+    { $set: { mandatoryJoinedAt: new Date(), joinPromptMessageId: null, joinPromptSentAt: null, onboardingGraceUntil: null } }
+  ).catch(() => null);
+  const didSet = !!(res && (res.modifiedCount === 1 || res.nModified === 1));
+  if (!didSet) return true;
+
+  await maybeCreditReferralForUser(telegram, userId).catch(() => {});
 
   const now = Date.now();
   const trialEndsAt = u.trialEndsAt ? new Date(u.trialEndsAt).getTime() : 0;
@@ -1044,7 +1542,7 @@ async function finalizeOnboardingIfJoined(settings, telegram, userIdStr) {
     await safeSendMessage(
       telegram,
       userId,
-      `For the next ${formatHumanTimeLeft(msLeft)}, I’ll keep hunting developer job requests and dropping the best ones into the community group.\n\nKeep checking the group — drops can land anytime.\nBefore your trial ends, I’ll send a reminder with the Pay button.`,
+      `For the next ${formatTrialTimeLeft(msLeft)}, I’ll keep hunting developer job requests and dropping the best ones into the community group.\n\nKeep checking the group — drops can land anytime.\nBefore your trial ends, I’ll send a reminder with the Pay button.`,
       null,
       'trial_started_notice_2'
     );
@@ -1068,6 +1566,191 @@ async function finalizeOnboardingIfJoined(settings, telegram, userIdStr) {
   return true;
 }
 
+async function maybeCreditReferralForUser(telegram, referredUserId) {
+  const referral = await Referral.findOne({ referredUserId: referredUserId.toString(), status: 'pending' }).lean();
+  if (!referral?.referrerUserId) return false;
+
+  const referrer = await BotUser.findOne({ userId: referral.referrerUserId.toString() }).lean();
+  if (!referrer) {
+    await Referral.updateOne({ _id: referral._id, status: 'pending' }, { $set: { status: 'invalidated' } }).catch(() => {});
+    return false;
+  }
+
+  const updated = await Referral.findOneAndUpdate(
+    { _id: referral._id, status: 'pending' },
+    { $set: { status: 'credited', creditedAt: new Date() } },
+    { new: true }
+  ).lean();
+  if (!updated) return false;
+
+  const inc = SUJICARDS.perReferral;
+  const referrerAfter = await BotUser.findOneAndUpdate(
+    { userId: referrer.userId },
+    { $inc: { sujicardBalance: inc } },
+    { new: true }
+  ).lean();
+
+  const referred = await BotUser.findOne({ userId: referredUserId.toString() }).lean();
+  const who = referred?.username || referredUserId.toString();
+  await safeSendMessage(
+    telegram,
+    referrer.userId,
+    `🔥🦅 Referral credited: ${who} (+${inc} Sujicard)`,
+    null,
+    'referral_credit_notify'
+  );
+  return true;
+}
+
+function escHtml(s) {
+  return (s ?? '')
+    .toString()
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+}
+
+async function replyOrEdit(ctx, text, extra = null) {
+  const payload = extra || {};
+  if (ctx.callbackQuery) {
+    await ctx.answerCbQuery().catch(() => {});
+    if (typeof ctx.editMessageText === 'function') {
+      const ok = await ctx.editMessageText(text, payload).then(() => true).catch(() => false);
+      if (ok) return true;
+    }
+  }
+  await ctx.reply(text, payload).catch(() => {});
+  return true;
+}
+
+function uiNoopKeyboard(rows) {
+  const out = rows
+    .map((r) =>
+      r
+        .map((label) => Markup.button.callback(label, 'ui_noop'))
+        .filter(Boolean)
+    )
+    .filter((r) => r.length);
+  return out.length ? Markup.inlineKeyboard(out) : {};
+}
+
+async function extendSubscriptionNow(userId, months = 1) {
+  const u = await BotUser.findOne({ userId: userId.toString() }).lean();
+  const currentEndMs = u?.subscriptionEndsAt ? new Date(u.subscriptionEndsAt).getTime() : 0;
+  const baseMs = Math.max(Date.now(), currentEndMs);
+  const newEnd = new Date(baseMs + Math.max(1, Number(months) || 1) * BILLING.monthMs);
+  await BotUser.updateOne(
+    { userId: userId.toString() },
+    {
+      $set: { subscriptionEndsAt: newEnd, removedAt: null, expiryReminder3dSentAt: null },
+      $unset: { pendingSubscriptionPaidAt: '', pendingSubscriptionMonths: '' },
+    }
+  ).catch(() => {});
+  return newEnd;
+}
+
+async function handleBalanceCommand(ctx) {
+  if (ctx.chat?.type !== 'private') return;
+  const { user } = await ensureBotUser(ctx);
+  const referrals = await getReferralCount(ctx.from.id.toString());
+  const bal = Number(user?.sujicardBalance || 0);
+  const text =
+    `🔥🦅 <b>Sujini Wallet</b>\n\n` +
+    `🪙 <b>Sujicards</b>: <b>${bal}</b>\n` +
+    `👥 <b>Referrals</b>: <b>${referrals}</b>\n\n` +
+    `Tip: share your link with <b>/ref</b> and move faster.`;
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback(`🪙 ${bal} Sujicards`, 'ui_noop'),
+      Markup.button.callback(`👥 ${referrals} referrals`, 'ui_noop'),
+    ],
+    [
+      Markup.button.callback('🔗 My referral link', 'user_ref'),
+      Markup.button.callback('🏆 Leaderboard', 'user_leaderboard'),
+    ],
+    [
+      Markup.button.callback('🪙 Pay 100 Sujicards', 'subscribe_cards'),
+      Markup.button.callback('💳 Pay 100 Stars', 'subscribe_100'),
+    ],
+    [Markup.button.callback('« Back', 'user_home')],
+  ]);
+  await replyOrEdit(ctx, text, { parse_mode: 'HTML', disable_web_page_preview: true, ...keyboard });
+}
+
+async function handleReferralCommand(ctx) {
+  if (ctx.chat?.type !== 'private') return;
+  const { user } = await ensureBotUser(ctx);
+  const botUsername = await getBotPublicUsername(ctx.telegram);
+  const referrals = await getReferralCount(ctx.from.id.toString());
+  const bal = Number(user?.sujicardBalance || 0);
+  const link = botUsername ? `https://t.me/${botUsername}?start=ref_${ctx.from.id}` : null;
+  const msg =
+    `🔥🦅 <b>Sujini Referral</b>\n\n` +
+    `Invite developers. Earn <b>${SUJICARDS.perReferral}</b> Sujicard when they join the required chats.\n` +
+    `Monthly access: <b>${SUJICARDS.monthlySubCost}</b> Sujicards or <b>100</b> Stars.\n\n` +
+    (link ? `<b>Your referral link</b>\n<code>${escHtml(link)}</code>\n\n` : '') +
+    `🪙 <b>Sujicards</b>: <b>${bal}</b>\n` +
+    `👥 <b>Referrals</b>: <b>${referrals}</b>`;
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('🧾 Balance', 'user_balance'),
+      Markup.button.callback('🏆 Leaderboard', 'user_leaderboard'),
+    ],
+    [
+      Markup.button.callback('🪙 Pay 100 Sujicards', 'subscribe_cards'),
+      Markup.button.callback('💳 Pay 100 Stars', 'subscribe_100'),
+    ],
+    [Markup.button.callback('« Back', 'user_home')],
+  ]);
+  await replyOrEdit(ctx, msg, { parse_mode: 'HTML', disable_web_page_preview: true, ...keyboard });
+}
+
+async function handleLeaderboardCommand(ctx) {
+  if (ctx.chat?.type !== 'private') return;
+  await ensureBotUser(ctx);
+
+  const rows = await Referral.aggregate([
+    { $match: { status: 'credited' } },
+    { $group: { _id: '$referrerUserId', total: { $sum: 1 } } },
+    { $sort: { total: -1 } },
+    { $limit: 15 },
+  ]);
+
+  if (!rows.length) {
+    await ctx.reply('Leaderboard is empty for now.').catch(() => {});
+    return;
+  }
+
+  const ids = rows.map(r => r?._id?.toString?.()).filter(Boolean);
+  const users = await BotUser.find({ userId: { $in: ids } }, { userId: 1, username: 1 }).lean();
+  const userMap = new Map(users.map(u => [u.userId.toString(), u]));
+
+  const lines = [];
+  rows.forEach((r, i) => {
+    const id = r._id?.toString?.() || '';
+    const u = userMap.get(id);
+    const label = u?.username || id;
+    lines.push(`${i + 1}. ${label} (${id}) — ${r.total}`);
+  });
+
+  const text =
+    `🔥🦅 <b>Top Referrers</b>\n\n` +
+    `<pre>${escHtml(lines.join('\n'))}</pre>\n` +
+    `Earn <b>${SUJICARDS.perReferral}</b> Sujicard per credited referral.`;
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('🔄 Refresh', 'user_leaderboard'),
+      Markup.button.callback('🔗 My referral link', 'user_ref'),
+    ],
+    [
+      Markup.button.callback('🧾 Balance', 'user_balance'),
+      Markup.button.callback('🪙 Pay 100 Sujicards', 'subscribe_cards'),
+    ],
+    [Markup.button.callback('« Back', 'user_home')],
+  ]);
+  await replyOrEdit(ctx, text, { parse_mode: 'HTML', disable_web_page_preview: true, ...keyboard });
+}
+
 async function handleUserStart(ctx) {
   const settings = await getSettings();
   if (!(await isUserFacingOperational(settings))) {
@@ -1075,7 +1758,7 @@ async function handleUserStart(ctx) {
     if (ctx.callbackQuery) {
       await ctx.answerCbQuery('Under maintenance', { show_alert: true }).catch(() => {});
     }
-    await ctx.reply(`Hey ${name}, Sujini bot is currently under maintenance. Please try again later.`).catch(() => {});
+    await ctx.reply(`Hey ${name} 🔥🦅\n\nSujini is under maintenance right now. Try again soon.`).catch(() => {});
     return;
   }
 
@@ -1085,11 +1768,17 @@ async function handleUserStart(ctx) {
     return;
   }
   await tryActivatePendingSubscription(settings, ctx.telegram, ctx.from.id).catch(() => {});
+  const freshUser = await BotUser.findOne({ userId: ctx.from.id.toString() }).lean().catch(() => null);
+  const currentUser = freshUser || user;
 
   const now = Date.now();
-  const trialEndsAt = user.trialEndsAt ? new Date(user.trialEndsAt).getTime() : 0;
-  const subEndsAt = user.subscriptionEndsAt ? new Date(user.subscriptionEndsAt).getTime() : 0;
+  const trialEndsAt = currentUser?.trialEndsAt ? new Date(currentUser.trialEndsAt).getTime() : 0;
+  const subEndsAt = currentUser?.subscriptionEndsAt ? new Date(currentUser.subscriptionEndsAt).getTime() : 0;
   const hasTimeAccess = now < trialEndsAt || now < subEndsAt;
+  const pendingMonths = Number(currentUser?.pendingSubscriptionMonths || 0);
+  const pendingOk = pendingMonths > 0;
+  const hasEverHadTimeAccess = !!(currentUser?.trialStartedAt || currentUser?.trialEndsAt || currentUser?.subscriptionEndsAt);
+  const allowJoinLinks = !hasEverHadTimeAccess || hasTimeAccess || pendingOk;
 
   const requiredChannelIds = (await getMandatoryChannelIds()).map((id) => Number(id)).filter((n) => Number.isFinite(n));
   const requiredGroupIds = (await getMandatoryGroupIds()).map((id) => Number(id)).filter((n) => Number.isFinite(n));
@@ -1107,7 +1796,7 @@ async function handleUserStart(ctx) {
 
   if (missing.length) {
     const name = getFriendlyName(ctx.from);
-    if (isNew) {
+    if (isNew && allowJoinLinks) {
       await ctx.reply(
         `Hey ${name} 🔥🦅\n\n` +
           `Welcome to Sujini — the Black Phoenix scout.\n` +
@@ -1115,23 +1804,66 @@ async function handleUserStart(ctx) {
         { disable_web_page_preview: true }
       ).catch(() => {});
     }
-    await sendJoinPromptIfNeeded(ctx, settings, user, missing);
+    if (!allowJoinLinks) {
+      const text =
+        `🔥 🦅 Your wings are grounded for now.\n\n` +
+        `Tap “Pay 100 Sujicards” or “Pay 100 Stars” to reactivate your subscription.`;
+      const keyboard = Markup.inlineKeyboard([
+        [
+          Markup.button.callback('🪙 Pay 100 Sujicards', 'subscribe_cards'),
+          Markup.button.callback('💳 Pay 100 Stars', 'subscribe_100'),
+        ],
+      ]);
+      await replyOrEdit(ctx, text, { disable_web_page_preview: true, ...keyboard }).catch(() => {});
+      return;
+    }
+    await sendJoinPromptIfNeeded(ctx, settings, currentUser, missing);
     return;
   }
 
-  if (!user.mandatoryJoinedAt) {
+  if (!currentUser?.mandatoryJoinedAt) {
     await finalizeOnboardingIfJoined(settings, ctx.telegram, ctx.from.id.toString()).catch(() => {});
     return;
   }
 
   const active = hasTimeAccess && hasAllMembership;
-  const ends = now < trialEndsAt ? new Date(trialEndsAt) : new Date(subEndsAt);
+  const isTrialActive = now < trialEndsAt;
+  const ends = isTrialActive ? new Date(trialEndsAt) : new Date(subEndsAt);
   const msLeft = ends.getTime() - now;
-  const text = active
-    ? `🔥 🦅 Sujini is on duty.\n\nI’ll keep hunting developer job requests for you from now until ${formatHumanDate(ends)} (${formatHumanTimeLeft(msLeft)}).\n\nKeep checking the community group — drops can land anytime.`
-    : `🔥 🦅 Your wings are grounded for now.\n\nWhen it’s time to renew, I’ll message you with the Pay button.`;
+  const statusLine = active
+    ? (isTrialActive
+        ? `🟢 <b>Status</b>: Trial ends in <b>${escHtml(formatTrialTimeLeft(msLeft))}</b>`
+        : `🟢 <b>Status</b>: Active until <b>${escHtml(formatHumanDate(ends))}</b>`)
+    : `🔴 <b>Status</b>: Inactive`;
+  const text =
+    `🔥🦅 <b>Sujini</b>\n\n` +
+    `${statusLine}\n\n` +
+    `I find developer jobs for you and tell you fast when someone needs a developer.\n` +
+    `Keep checking the community group — drops can land anytime.`;
 
-  await ctx.reply(text, { disable_web_page_preview: true }).catch(() => {});
+  const keyboard = active
+    ? Markup.inlineKeyboard([
+        [
+          Markup.button.callback('🧾 Balance', 'user_balance'),
+          Markup.button.callback('🔗 Referral', 'user_ref'),
+        ],
+        [
+          Markup.button.callback('🏆 Leaderboard', 'user_leaderboard'),
+          Markup.button.callback('🪙 Pay 100 Sujicards', 'subscribe_cards'),
+        ],
+      ])
+    : Markup.inlineKeyboard([
+        [
+          Markup.button.callback('🪙 Pay 100 Sujicards', 'subscribe_cards'),
+          Markup.button.callback('💳 Pay 100 Stars', 'subscribe_100'),
+        ],
+        [
+          Markup.button.callback('🧾 Balance', 'user_balance'),
+          Markup.button.callback('🔗 Referral', 'user_ref'),
+        ],
+      ]);
+
+  await replyOrEdit(ctx, text, { parse_mode: 'HTML', disable_web_page_preview: true, ...keyboard });
 }
 
 export async function handleAdminsMenu(ctx) {
@@ -1221,25 +1953,38 @@ export async function handleAccountDetail(ctx, accId) {
   const acc = await Account.findById(accId);
   if (!acc) { await ctx.answerCbQuery('Not found'); return handleAccounts(ctx); }
 
+  const nowMs = Date.now();
   const joining = isJoinWorkerRunning(acc._id);
   const messaging = isMessageWorkerRunning(acc._id);
+  const joinLeaseOk = acc.joiningLeaseExpiresAt ? (new Date(acc.joiningLeaseExpiresAt).getTime() > nowMs) : false;
+  const msgLeaseOk = acc.messagingLeaseExpiresAt ? (new Date(acc.messagingLeaseExpiresAt).getTime() > nowMs) : false;
+  const msgState = messaging ? '🟢' : acc.isMessaging && msgLeaseOk ? '🟡' : '🔴';
+  const joinState = joining ? '🟢' : acc.isJoining && joinLeaseOk ? '🟡' : '🔴';
   const limitInfo = acc.searchLimitHit
-    ? `\n⚠️ Search limit resets: ${acc.searchLimitResetsAt?.toUTCString() || 'unknown'}`
+    ? ` · limit resets: ${acc.searchLimitResetsAt?.toUTCString() || 'unknown'}`
     : '';
+
+  const lastSeenMs = acc.listenerLastSeenAt ? new Date(acc.listenerLastSeenAt).getTime() : 0;
+  const seenAgeSec = lastSeenMs ? Math.max(0, Math.floor((nowMs - lastSeenMs) / 1000)) : null;
+  const seenAge =
+    seenAgeSec == null ? 'never'
+      : seenAgeSec < 60 ? `${seenAgeSec}s`
+        : seenAgeSec < 3600 ? `${Math.floor(seenAgeSec / 60)}m`
+          : `${Math.floor(seenAgeSec / 3600)}h`;
+  const listenerInfo = acc.role === 'listener' ? ` · seen: ${seenAge}` : '';
 
   const text =
     `*${acc.username ? '@' + acc.username : acc.number}*\n` +
     `Role: *${acc.role}*\n` +
-    `Groups joined: *${acc.groups.length}*${limitInfo}\n` +
-    `Join/Search: ${joining ? '✅ Running' : '⏹️ Stopped'}\n` +
-    `Listen/Preach: ${messaging ? '✅ Running' : '⏹️ Stopped'}`;
+    `Groups: *${acc.groups.length}*${limitInfo}\n` +
+    `Join/Search: ${joinState}   Listen/Preach: ${msgState}${listenerInfo}`;
 
   const joinBtn = joining
-    ? Markup.button.callback('⏹️ Stop Join/Search', `stop_join_${acc._id}`)
-    : Markup.button.callback('▶️ Start Join/Search', `start_join_${acc._id}`);
+    ? Markup.button.callback('🔴 Stop Join/Search', `stop_join_${acc._id}`)
+    : Markup.button.callback('🟢 Start Join/Search', `start_join_${acc._id}`);
   const msgBtn = messaging
-    ? Markup.button.callback('⏹️ Stop Listen/Preach', `stop_msg_${acc._id}`)
-    : Markup.button.callback('▶️ Start Listen/Preach', `start_msg_${acc._id}`);
+    ? Markup.button.callback('🔴 Stop Listen/Preach', `stop_msg_${acc._id}`)
+    : Markup.button.callback('🟢 Start Listen/Preach', `start_msg_${acc._id}`);
 
   await ctx.editMessageText(text, {
     parse_mode: 'Markdown',
@@ -1409,6 +2154,23 @@ async function _saveNewAccount(ctx, phoneNumber) {
   clearSession(ctx.from.id);
 
   const me = await authClient.getMe();
+  const roleLabel = role === 'finder' ? 'groupfinder' : role;
+  const rawId = me.id?.toString?.() || phoneNumber.replace(/\D/g, '');
+  const idPrefix = rawId.toString().replace(/\D/g, '').slice(0, 5) || rawId.toString().slice(0, 5);
+  const desiredBase = `${roleLabel}_${idPrefix}`;
+  const desiredUsername = desiredBase
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, '_')
+    .replace(/^_+/, '')
+    .slice(0, 32);
+
+  await authClient
+    .invoke(new Api.account.UpdateProfile({ firstName: desiredBase, lastName: '' }))
+    .catch(() => {});
+  if (desiredUsername && desiredUsername.length >= 5) {
+    await authClient.invoke(new Api.account.UpdateUsername({ username: desiredUsername })).catch(() => {});
+  }
+
   const sessionString = authClient.session.save();
   await authClient.disconnect();
   authClient = null;
@@ -1429,7 +2191,7 @@ async function _saveNewAccount(ctx, phoneNumber) {
   }
   await Account.create({
     number: phoneNumber,
-    username: me.username || null,
+    username: desiredUsername || me.username || null,
     userId: me.id?.toString() || null,
     session: sessionString,
     role,
@@ -1439,7 +2201,7 @@ async function _saveNewAccount(ctx, phoneNumber) {
   });
 
   await ctx.reply(
-    `✅ *Account added!*\nType: *${role}*\nUsername: ${me.username ? '@' + me.username : 'N/A'}\nPhone: ${phoneNumber}`,
+    `✅ *Account added!*\nType: *${role}*\nUsername: ${desiredUsername ? '@' + desiredUsername : me.username ? '@' + me.username : 'N/A'}\nPhone: ${phoneNumber}`,
     { parse_mode: 'Markdown', ...mainMenu() }
   );
 }
@@ -1671,13 +2433,14 @@ export async function handleBroadcastMenu(ctx) {
   if (!(await requireAdmin(ctx))) return;
   const text =
     `📣 *Broadcast*\n\n` +
-    `Send one message (text/photo/video/document/etc) and it will be copied to all bot users (in DB) in batches.\n` +
+    `Send one message (text/photo/video/document/etc) and it will be copied to selected bot users (in DB) in batches.\n` +
     `Rate limit is capped at 28 messages/sec.`;
 
   await ctx.editMessageText(text, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
-      [Markup.button.callback('▶️ Start Broadcast', 'broadcast_start')],
+      [Markup.button.callback('▶️ All users', 'broadcast_start')],
+      [Markup.button.callback('🧊 Expired subscribers', 'broadcast_start_expired')],
       [Markup.button.callback('« Back', 'back_to_main')],
     ]),
   });
@@ -1686,25 +2449,41 @@ export async function handleBroadcastMenu(ctx) {
 
 const activeBroadcastByAdmin = new Set();
 
-export async function handleBroadcastStart(ctx) {
+async function startBroadcastWithTarget(ctx, target) {
   if (!(await requireAdmin(ctx))) return;
-  setSession(ctx.from.id, { step: 'awaiting_broadcast_message', data: {} });
+  setSession(ctx.from.id, { step: 'awaiting_broadcast_message', data: { target } });
   await ctx.editMessageText(
-    'Send the message to broadcast (any format).',
+    target === 'expired_subscribers'
+      ? 'Send the message to broadcast to expired subscribers (any format).'
+      : 'Send the message to broadcast (any format).',
     Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'broadcast_menu')]])
   );
   await ctx.answerCbQuery();
 }
 
-async function runBroadcastCopy(telegram, adminId, fromChatId, messageId) {
+export async function handleBroadcastStart(ctx) {
+  return startBroadcastWithTarget(ctx, 'all');
+}
+
+export async function handleBroadcastStartExpired(ctx) {
+  return startBroadcastWithTarget(ctx, 'expired_subscribers');
+}
+
+async function runBroadcastCopy(telegram, adminId, fromChatId, messageId, target = 'all') {
   const batchSize = 500;
   let lastId = null;
   let enqueued = 0;
   let sent = 0;
   let failed = 0;
+  const now = new Date();
 
   while (true) {
     const q = { bannedAt: null };
+    if (target === 'expired_subscribers') {
+      q.pendingSubscriptionMonths = { $lte: 0 };
+      q.subscriptionEndsAt = { $ne: null, $lte: now };
+      q.$or = [{ trialEndsAt: null }, { trialEndsAt: { $lte: now } }];
+    }
     if (lastId) q._id = { $gt: lastId };
     const users = await BotUser.find(q).sort({ _id: 1 }).limit(batchSize).lean();
     if (!users.length) break;
@@ -1722,10 +2501,11 @@ async function runBroadcastCopy(telegram, adminId, fromChatId, messageId) {
   }
 
   await outboundQueue.onIdle();
+  const label = target === 'expired_subscribers' ? 'Expired subscribers' : 'All users';
   await safeSendMessage(
     telegram,
     adminId,
-    `📣 Broadcast finished.\n\nEnqueued: ${enqueued}\nSent: ${sent}\nFailed: ${failed}`,
+    `📣 Broadcast finished (${label}).\n\nEnqueued: ${enqueued}\nSent: ${sent}\nFailed: ${failed}`,
     null,
     'broadcast_done'
   );
@@ -1734,6 +2514,7 @@ async function runBroadcastCopy(telegram, adminId, fromChatId, messageId) {
 export async function handleBroadcastMessage(ctx) {
   if (!(await requireAdmin(ctx))) return;
 
+  const session = getSession(ctx.from?.id);
   const adminId = ctx.from.id.toString();
   if (activeBroadcastByAdmin.has(adminId)) {
     clearSession(ctx.from.id);
@@ -1744,11 +2525,12 @@ export async function handleBroadcastMessage(ctx) {
   const messageId = ctx.message?.message_id;
   clearSession(ctx.from.id);
   if (!messageId) return ctx.reply('⚠️ Invalid message. Try again.').catch(() => {});
+  const target = session?.data?.target || 'all';
 
   activeBroadcastByAdmin.add(adminId);
   await ctx.reply('✅ Broadcast started.').catch(() => {});
 
-  runBroadcastCopy(ctx.telegram, adminId, fromChatId, messageId)
+  runBroadcastCopy(ctx.telegram, adminId, fromChatId, messageId, target)
     .catch(err => console.error(`[broadcast] failed: ${err?.message || err}`))
     .finally(() => activeBroadcastByAdmin.delete(adminId));
 }
@@ -1924,11 +2706,11 @@ export async function handleToggleAiAlerts(ctx) {
 
 function formatCandidatePost(fields) {
   const lines = [];
-  if (fields.senderName) lines.push(fields.senderName);
-  if (fields.senderId) lines.push(fields.senderId);
-  if (fields.groupLink) lines.push(fields.groupLink);
-  if (fields.messageLink) lines.push(fields.messageLink);
-  if (fields.senderUsername) lines.push(fields.senderUsername);
+  if (fields.senderName) lines.push(`Name: ${fields.senderName}`);
+  if (fields.senderId) lines.push(`User ID: ${fields.senderId}`);
+  if (fields.groupLink) lines.push(`Source Group: ${fields.groupLink}`);
+  if (fields.messageLink) lines.push(`Source Message: ${fields.messageLink}`);
+  if (fields.senderUsername) lines.push(`Username: ${fields.senderUsername}`);
   const suffix = lines.length ? `\n\n${lines.join('\n')}` : '';
   return `${fields.message}${suffix}`;
 }
@@ -1999,7 +2781,7 @@ export async function handleDeleteDead(ctx) {
 export async function handleStartAll(ctx) {
   if (!(await requireAdmin(ctx))) return;
   if (!(await ensureOperationalPrereqs(ctx))) return;
-  const accounts = await Account.find({ session: { $nin: [null, ''] } });
+  const accounts = await Account.find({ session: { $nin: [null, ''] }, role: { $ne: 'inviter' } });
   for (const acc of accounts) {
     await startJoinWorker(acc._id);
     await startMessageWorker(acc._id);
@@ -2010,12 +2792,34 @@ export async function handleStartAll(ctx) {
 
 export async function handleStopAll(ctx) {
   if (!(await requireAdmin(ctx))) return;
-  const accounts = await Account.find({});
+  const accounts = await Account.find({ role: { $ne: 'inviter' } });
   for (const acc of accounts) {
     await stopJoinWorker(acc._id);
     await stopMessageWorker(acc._id);
   }
   await ctx.answerCbQuery('⏹️ All workers stopped');
+  return handleStart(ctx);
+}
+
+export async function handleToggleAll(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const anyRunning = isAnyJoinWorkerRunning() || isAnyMessageWorkerRunning();
+  if (anyRunning) {
+    const accounts = await Account.find({ role: { $ne: 'inviter' } });
+    for (const acc of accounts) {
+      await stopJoinWorker(acc._id);
+      await stopMessageWorker(acc._id);
+    }
+    await ctx.answerCbQuery('🔴 Stopped');
+    return handleStart(ctx);
+  }
+  if (!(await ensureOperationalPrereqs(ctx))) return;
+  const accounts = await Account.find({ session: { $nin: [null, ''] }, role: { $ne: 'inviter' } });
+  for (const acc of accounts) {
+    await startJoinWorker(acc._id);
+    await startMessageWorker(acc._id);
+  }
+  await ctx.answerCbQuery('🟢 Started');
   return handleStart(ctx);
 }
 
@@ -2030,6 +2834,244 @@ export async function handleSubscribe(ctx) {
     prices: [{ label: 'Monthly', amount: 100 }],
   });
   await ctx.answerCbQuery();
+}
+
+export async function handleSubscribeWithSujicards(ctx) {
+  if (ctx.chat?.type !== 'private') {
+    if (ctx.callbackQuery) await ctx.answerCbQuery('Use this in DM', { show_alert: true }).catch(() => {});
+    return;
+  }
+
+  const userId = ctx.from.id.toString();
+  const user = await BotUser.findOne({ userId }, { sujicardBalance: 1, bannedAt: 1 }).lean();
+  if (!user) {
+    if (ctx.callbackQuery) await ctx.answerCbQuery('Start the bot first: /start', { show_alert: true }).catch(() => {});
+    await ctx.reply('Start the bot first: /start').catch(() => {});
+    return;
+  }
+  if (user.bannedAt) {
+    if (ctx.callbackQuery) await ctx.answerCbQuery('Banned', { show_alert: true }).catch(() => {});
+    return;
+  }
+
+  const cost = SUJICARDS.monthlySubCost;
+  const balance = Number(user.sujicardBalance || 0);
+  if (balance < cost) {
+    const missing = cost - balance;
+    const msg = `Not enough Sujicards. Need ${cost}, you have ${balance} (short ${missing}).`;
+    if (ctx.callbackQuery) await ctx.answerCbQuery(msg, { show_alert: true }).catch(() => {});
+    else await ctx.reply(msg).catch(() => {});
+    return;
+  }
+
+  const nonce = newNonce();
+  await BotUser.updateOne(
+    { userId },
+    { $set: { pendingSujicardConfirmNonce: nonce, pendingSujicardConfirmExpiresAt: new Date(Date.now() + 5 * 60 * 1000) } }
+  ).catch(() => {});
+
+  const text =
+    `⚠️ Confirm payment\n\n` +
+    `You’re about to spend *${cost} Sujicards* for *1 month*.\n` +
+    `Balance: *${balance}*`;
+
+  if (ctx.callbackQuery?.message) {
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(sujicardConfirmKeyboard(nonce, cost).reply_markup.inline_keyboard) })
+      .catch(() => ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(sujicardConfirmKeyboard(nonce, cost).reply_markup.inline_keyboard) }).catch(() => {}));
+    await ctx.answerCbQuery('Confirm?', { show_alert: false }).catch(() => {});
+    return;
+  }
+
+  await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(sujicardConfirmKeyboard(nonce, cost).reply_markup.inline_keyboard) }).catch(() => {});
+}
+
+async function handleSubscribeWithSujicardsConfirm(ctx) {
+  if (ctx.chat?.type !== 'private') {
+    if (ctx.callbackQuery) await ctx.answerCbQuery('Use this in DM', { show_alert: true }).catch(() => {});
+    return;
+  }
+
+  const userId = ctx.from.id.toString();
+  const username = ctx.from?.username ? '@' + ctx.from.username.replace(/^@/, '') : null;
+
+  const nonce = ctx?.match?.[1]?.toString?.() || '';
+  if (ctx.callbackQuery) await ctx.answerCbQuery('⏳ Processing…', { show_alert: false }).catch(() => {});
+  if (!nonce) {
+    if (ctx.callbackQuery) await ctx.answerCbQuery('Expired. Tap Pay again.', { show_alert: false }).catch(() => {});
+    return;
+  }
+
+  const cost = SUJICARDS.monthlySubCost;
+  const now = new Date();
+  const updated = await BotUser.findOneAndUpdate(
+    {
+      userId,
+      bannedAt: null,
+      sujicardBalance: { $gte: cost },
+      pendingSujicardConfirmNonce: nonce,
+      pendingSujicardConfirmExpiresAt: { $gt: now },
+    },
+    {
+      $inc: { pendingSubscriptionMonths: 1, sujicardBalance: -cost },
+      $set: { pendingSubscriptionPaidAt: now, lastSujicardConfirmNonce: nonce, lastSujicardConfirmAt: now, ...(username ? { username } : {}) },
+      $unset: { pendingSujicardConfirmNonce: '', pendingSujicardConfirmExpiresAt: '' },
+    },
+    { new: true }
+  ).catch(() => null);
+
+  if (!updated) {
+    const u = await BotUser.findOne({ userId }).lean().catch(() => null);
+    const lastAt = u?.lastSujicardConfirmAt ? new Date(u.lastSujicardConfirmAt).getTime() : 0;
+    const recentlyConfirmed = u?.lastSujicardConfirmNonce === nonce && lastAt && (Date.now() - lastAt) < 5 * 60 * 1000;
+    if (!recentlyConfirmed) {
+      if (ctx.callbackQuery) await ctx.answerCbQuery('Not confirmed. Tap Pay again.', { show_alert: false }).catch(() => {});
+      return;
+    }
+
+    const settings = await getSettings();
+    const channelIds = await getMandatoryChannelIds();
+    const groupIds = await getMandatoryGroupIds();
+    await ensureUserUnbannedInChats(settings, ctx.telegram, userId, [...channelIds, ...groupIds]);
+    const missingChannelIds = [];
+    const missingGroupIds = [];
+    for (const cid of channelIds) {
+      const id = cid?.toString?.() || null;
+      if (!id) continue;
+      if (!(await isMember(ctx.telegram, Number(id), Number(userId)))) missingChannelIds.push(id);
+    }
+    for (const gid of groupIds) {
+      const id = gid?.toString?.() || null;
+      if (!id) continue;
+      if (!(await isMember(ctx.telegram, Number(id), Number(userId)))) missingGroupIds.push(id);
+    }
+
+    if (!missingChannelIds.length && !missingGroupIds.length) {
+      const pendingMonths = Number(u?.pendingSubscriptionMonths || 0);
+      if (pendingMonths > 0) await extendSubscriptionNow(userId, pendingMonths);
+      const fresh = await BotUser.findOne({ userId }).lean().catch(() => null);
+      const ends = fresh?.subscriptionEndsAt ? new Date(fresh.subscriptionEndsAt) : null;
+      const text = ends
+        ? `🔥 🦅 Payment already confirmed.\n\nActive until ${formatHumanDate(ends)}.`
+        : '🔥 🦅 Payment already confirmed.';
+      if (ctx.callbackQuery?.message) {
+        await ctx.editMessageText(text, { disable_web_page_preview: true }).catch(() => {});
+      } else {
+        await ctx.reply(text, { disable_web_page_preview: true }).catch(() => {});
+      }
+      return;
+    }
+
+    const invites = await ensureUserInviteTickets(settings, userId, { chatIds: [...missingChannelIds, ...missingGroupIds] });
+    const rows = [];
+    for (let i = 0; i < missingGroupIds.length; i += 1) {
+      const id = missingGroupIds[i];
+      const link = invites.groups?.[id] || null;
+      if (link) rows.push([Markup.button.url(missingGroupIds.length > 1 ? `Join Group ${i + 1}` : 'Join Group', link)]);
+    }
+    for (let i = 0; i < missingChannelIds.length; i += 1) {
+      const id = missingChannelIds[i];
+      const link = invites.channels?.[id] || null;
+      if (link) rows.push([Markup.button.url(missingChannelIds.length > 1 ? `Join Channel ${i + 1}` : 'Join Channel', link)]);
+    }
+
+    const msg =
+      `🔥 🦅 Payment already confirmed.\n\n` +
+      `Tap to join what you’re missing.\n` +
+      `After you join, come back here — I’ll verify and switch you on.`;
+    if (ctx.callbackQuery?.message) {
+      await ctx.editMessageText(msg, { disable_web_page_preview: true, ...Markup.inlineKeyboard(rows) }).catch(() => {});
+    } else {
+      await ctx.reply(msg, { disable_web_page_preview: true, ...Markup.inlineKeyboard(rows) }).catch(() => {});
+    }
+    return;
+  }
+
+  await Payment.create({
+    userId,
+    username,
+    kind: 'subscription',
+    currency: 'SUJICARD',
+    totalAmount: cost,
+    months: 1,
+    invoicePayload: JSON.stringify({ userId, kind: 'subscription', method: 'sujicard' }),
+    telegramPaymentChargeId: null,
+    providerPaymentChargeId: null,
+  }).catch(() => {});
+
+  const settings = await getSettings();
+  const channelIds = await getMandatoryChannelIds();
+  const groupIds = await getMandatoryGroupIds();
+  await ensureUserUnbannedInChats(settings, ctx.telegram, userId, [...channelIds, ...groupIds]);
+  const missingChannelIds = [];
+  const missingGroupIds = [];
+  for (const cid of channelIds) {
+    const id = cid?.toString?.() || null;
+    if (!id) continue;
+    if (!(await isMember(ctx.telegram, Number(id), Number(userId)))) missingChannelIds.push(id);
+  }
+  for (const gid of groupIds) {
+    const id = gid?.toString?.() || null;
+    if (!id) continue;
+    if (!(await isMember(ctx.telegram, Number(id), Number(userId)))) missingGroupIds.push(id);
+  }
+
+  if (!missingChannelIds.length && !missingGroupIds.length) {
+    const newEnd = await extendSubscriptionNow(userId, 1);
+    const text = `🔥 🦅 Payment received (${cost} Sujicards).\n\nActive until ${formatHumanDate(newEnd)}.`;
+    if (ctx.callbackQuery?.message) {
+      await ctx.editMessageText(text, { disable_web_page_preview: true }).catch(() => {});
+    } else {
+      await ctx.reply(text, { disable_web_page_preview: true }).catch(() => {});
+    }
+    return;
+  }
+
+  const invites = await ensureUserInviteTickets(settings, userId, { chatIds: [...missingChannelIds, ...missingGroupIds] });
+  const rows = [];
+  for (let i = 0; i < missingGroupIds.length; i += 1) {
+    const id = missingGroupIds[i];
+    const link = invites.groups?.[id] || null;
+    if (link) rows.push([Markup.button.url(missingGroupIds.length > 1 ? `Join Group ${i + 1}` : 'Join Group', link)]);
+  }
+  for (let i = 0; i < missingChannelIds.length; i += 1) {
+    const id = missingChannelIds[i];
+    const link = invites.channels?.[id] || null;
+    if (link) rows.push([Markup.button.url(missingChannelIds.length > 1 ? `Join Channel ${i + 1}` : 'Join Channel', link)]);
+  }
+
+  const msg =
+    `🔥 🦅 Payment received (${cost} Sujicards).\n\n` +
+    `Tap to join what you’re missing.\n` +
+    `After you join, come back here — I’ll verify and switch you on.`;
+  if (ctx.callbackQuery?.message) {
+    await ctx.editMessageText(msg, { disable_web_page_preview: true, ...Markup.inlineKeyboard(rows) }).catch(() => {});
+  } else {
+    await ctx.reply(msg, { disable_web_page_preview: true, ...Markup.inlineKeyboard(rows) }).catch(() => {});
+  }
+}
+
+async function handleSubscribeWithSujicardsCancel(ctx) {
+  const nonce = ctx?.match?.[1]?.toString?.() || '';
+  const userId = ctx.from?.id?.toString?.() || '';
+  let matched = false;
+  if (nonce && userId) {
+    const res = await BotUser.updateOne(
+      { userId, pendingSujicardConfirmNonce: nonce },
+      { $unset: { pendingSujicardConfirmNonce: '', pendingSujicardConfirmExpiresAt: '' } }
+    ).catch(() => {});
+    matched = !!(res && (res.modifiedCount === 1 || res.nModified === 1 || res.matchedCount === 1));
+  }
+  if (!matched) {
+    if (ctx.callbackQuery) await ctx.answerCbQuery('Nothing to cancel', { show_alert: false }).catch(() => {});
+    return;
+  }
+  if (ctx.callbackQuery) await ctx.answerCbQuery('Cancelled', { show_alert: false }).catch(() => {});
+  const text = 'Payment cancelled.';
+  if (ctx.callbackQuery?.message) {
+    await ctx.editMessageText(text, { disable_web_page_preview: true, ...pay100Keyboard() }).catch(() => {});
+  } else {
+    await ctx.reply(text, { disable_web_page_preview: true, ...pay100Keyboard() }).catch(() => {});
+  }
 }
 
 async function handleSuccessfulPayment(ctx) {
@@ -2069,6 +3111,7 @@ async function handleSuccessfulPayment(ctx) {
     const settings = await getSettings();
     const channelIds = await getMandatoryChannelIds();
     const groupIds = await getMandatoryGroupIds();
+    await ensureUserUnbannedInChats(settings, ctx.telegram, userId, [...channelIds, ...groupIds]);
     const missingChannelIds = [];
     const missingGroupIds = [];
     for (const cid of channelIds) {
@@ -2083,24 +3126,31 @@ async function handleSuccessfulPayment(ctx) {
     }
 
     if (!missingChannelIds.length && !missingGroupIds.length) {
-      await ctx.reply(`🔥 🦅 Payment received (${payment.total_amount} Stars).\n\nYou’re already in the nest. I’ll verify and switch you on shortly.`, { disable_web_page_preview: true }).catch(() => {});
+      const newEnd = await extendSubscriptionNow(userId, 1);
+      await ctx.reply(
+        `🔥 🦅 Payment received (${payment.total_amount} Stars).\n\nActive until ${formatHumanDate(newEnd)}.`,
+        { disable_web_page_preview: true }
+      ).catch(() => {});
       return;
     }
 
     const invites = await ensureUserInviteTickets(settings, userId, { chatIds: [...missingChannelIds, ...missingGroupIds] });
-    let msg = `🔥 🦅 Payment received (${payment.total_amount} Stars).\n\nTap to join what you’re missing:`;
+    const rows = [];
     for (let i = 0; i < missingGroupIds.length; i += 1) {
       const id = missingGroupIds[i];
       const link = invites.groups?.[id] || null;
-      if (link) msg += `\n- group: ${link}`;
+      if (link) rows.push([Markup.button.url(missingGroupIds.length > 1 ? `Join Group ${i + 1}` : 'Join Group', link)]);
     }
     for (let i = 0; i < missingChannelIds.length; i += 1) {
       const id = missingChannelIds[i];
       const link = invites.channels?.[id] || null;
-      if (link) msg += `\n- channel: ${link}`;
+      if (link) rows.push([Markup.button.url(missingChannelIds.length > 1 ? `Join Channel ${i + 1}` : 'Join Channel', link)]);
     }
-    msg += `\n\nAfter you join, come back here — I’ll confirm everything automatically.`;
-    await ctx.reply(msg, { disable_web_page_preview: true }).catch(() => {});
+    const msg =
+      `🔥 🦅 Payment received (${payment.total_amount} Stars).\n\n` +
+      `Tap to join what you’re missing.\n` +
+      `After you join, come back here — I’ll verify and switch you on.`;
+    await ctx.reply(msg, { disable_web_page_preview: true, ...Markup.inlineKeyboard(rows) }).catch(() => {});
   } catch {
     await ctx.reply('✅ Payment received.');
   }
@@ -2143,31 +3193,37 @@ export async function handleChatMember(ctx) {
     const isNowIn = newStatus === 'member' || newStatus === 'administrator' || newStatus === 'creator';
     if (!wasOut || !isNowIn) return;
 
-    if (await isAdmin(user.id, user.username)) return;
-
-    const u = await BotUser.findOne({ userId: user.id.toString() });
-    if (!u) {
-      const res = await removeUserFromChat(ctx.telegram, ctx.chat.id, user.id, 'join_without_record');
-      return;
-    }
-
-    if (u.bannedAt) {
-      const res = await removeUserFromChat(ctx.telegram, ctx.chat.id, user.id, 'banned_join_attempt');
-      return;
-    }
-    await tryActivatePendingSubscription(s, ctx.telegram, user.id).catch(() => {});
-    await finalizeOnboardingIfJoined(s, ctx.telegram, user.id.toString()).catch(() => {});
-
-    const now = Date.now();
-    const trialOk = u?.trialEndsAt && now < new Date(u.trialEndsAt).getTime();
-    const subOk = u?.subscriptionEndsAt && now < new Date(u.subscriptionEndsAt).getTime();
-    const pendingOk = (u?.pendingSubscriptionMonths || 0) > 0;
-    const active = !!(trialOk || subOk || pendingOk);
-    if (active) return;
-
-    const res = await removeUserFromChat(ctx.telegram, ctx.chat.id, user.id, 'inactive_join_attempt');
-    await safeSendMessage(ctx.telegram, user.id, 'You must start the bot and have an active subscription/trial to stay in the community.', null, 'inactive_join_attempt_dm');
+    await enforceMandatoryJoinGate(s, ctx.telegram, chatId, user, 'chat_member_join').catch(() => {});
   } catch {}
+}
+
+const scheduledUnbans = new Map();
+let membershipSweepRunning = false;
+
+function scheduleUnban(telegram, chatId, userId, delays = null) {
+  const cid = chatId?.toString?.() || '';
+  const uid = userId?.toString?.() || '';
+  const key = cid && uid ? `${cid}:${uid}` : null;
+  if (!key) return;
+  if (scheduledUnbans.has(key)) return;
+  scheduledUnbans.set(key, true);
+
+  const plan = Array.isArray(delays) && delays.length ? delays : [2500, 9000, 22000];
+  for (const ms of plan) {
+    const t = setTimeout(() => {
+      outboundQueue.enqueue(async () => {
+        const ok = await telegram.unbanChatMember(Number(cid), Number(uid)).then(() => true).catch(() => false);
+        if (!ok) {
+          const s = await getSettings().catch(() => null);
+          if (s) await tryUnbanWithInviter(s, cid, uid).catch(() => {});
+        }
+      });
+    }, ms);
+    if (t?.unref) t.unref();
+  }
+
+  const cleanup = setTimeout(() => scheduledUnbans.delete(key), Math.max(...plan) + 5000);
+  if (cleanup?.unref) cleanup.unref();
 }
 
 async function removeUserFromChat(telegram, chatId, userId, context = '') {
@@ -2181,12 +3237,37 @@ async function removeUserFromChat(telegram, chatId, userId, context = '') {
       return out;
     }
   } catch {}
+  const ctx = (context || '').toString();
+  const banSeconds =
+    ctx.includes('gate_') ? 10 * 60 :
+    ctx.includes('sweep_remove_expired') ? 10 :
+    60;
+  const shouldUnbanNow = !ctx.includes('gate_');
+  const untilDate = Math.floor(Date.now() / 1000) + banSeconds;
+
   try {
-    await telegram.banChatMember(Number(chatId), Number(userId));
+    await telegram.banChatMember(Number(chatId), Number(userId), { until_date: untilDate });
   } catch (err) {
     const { desc } = describeTelegramError(err);
     out.desc = desc;
-    console.warn(`[kick] ${context} ban chatId=${chatId} userId=${userId} desc=${desc}`);
+    const s = await getSettings().catch(() => null);
+    const viaInviter = s && isAdminRightsError(desc)
+      ? await tryKickWithInviter(s, chatId?.toString?.() || '', userId?.toString?.() || '', untilDate, shouldUnbanNow).catch(() => false)
+      : false;
+    if (!viaInviter) {
+      console.warn(`[kick] ${context} ban chatId=${chatId} userId=${userId} desc=${desc}`);
+      return out;
+    }
+    out.ok = true;
+    if (!shouldUnbanNow) {
+      scheduleUnban(telegram, chatId, userId, [10 * 60 * 1000 + 2000]);
+    }
+    return out;
+  }
+
+  out.ok = true;
+  if (!shouldUnbanNow) {
+    scheduleUnban(telegram, chatId, userId, [10 * 60 * 1000 + 2000]);
     return out;
   }
 
@@ -2196,102 +3277,151 @@ async function removeUserFromChat(telegram, chatId, userId, context = '') {
     const { desc } = describeTelegramError(err);
     out.desc = desc;
     console.warn(`[kick] ${context} unban chatId=${chatId} userId=${userId} desc=${desc}`);
+    scheduleUnban(telegram, chatId, userId);
     return out;
   }
 
-  out.ok = true;
   return out;
 }
 
 async function membershipSweep(telegram) {
+  if (membershipSweepRunning) return;
+  membershipSweepRunning = true;
   const s = await getSettings();
   const requiredIds = (await getMandatoryChatIds()).filter(Boolean);
-  if (!requiredIds.length) return;
+  if (!requiredIds.length) { membershipSweepRunning = false; return; }
+  const hasLease = await acquireMembershipSweepLease(s);
+  if (!hasLease) { membershipSweepRunning = false; return; }
 
-  const now = Date.now();
-  const users = await BotUser.find({}).lean();
+  try {
+    const now = Date.now();
+    const users = await BotUser.find({
+      $or: [
+        { bannedAt: { $ne: null } },
+        { pendingSubscriptionMonths: { $gt: 0 } },
+        { joinPromptMessageId: { $ne: null }, mandatoryJoinedAt: null },
+        { removedAt: null, bannedAt: null, pendingSubscriptionMonths: { $lte: 0 }, $or: [{ trialEndsAt: { $ne: null } }, { subscriptionEndsAt: { $ne: null } }] },
+      ],
+    }).lean();
 
-  for (const u of users) {
-    if (u.bannedAt) {
-      if (!u.removedAt) {
+    let lastRenewAt = Date.now();
+    for (const u of users) {
+      if (Date.now() - lastRenewAt > MEMBERSHIP_SWEEP_LEASE_MS / 2) {
+        lastRenewAt = Date.now();
+        await renewMembershipSweepLease(s);
+      }
+
+      if (u.bannedAt) {
+        if (!u.removedAt) {
+          let allRemoved = true;
+          for (const cid of requiredIds) {
+            const res = await removeUserFromChat(telegram, cid, u.userId, 'sweep_remove_banned');
+            if (!res.ok) allRemoved = false;
+          }
+          if (allRemoved) {
+            await BotUser.updateOne({ _id: u._id, removedAt: null }, { $set: { removedAt: new Date() } });
+          }
+        }
+        continue;
+      }
+
+      if ((u.pendingSubscriptionMonths || 0) > 0) {
+        await tryActivatePendingSubscription(s, telegram, u.userId).catch(() => {});
+      }
+
+      if (!u.mandatoryJoinedAt && u.joinPromptMessageId) {
+        await finalizeOnboardingIfJoined(s, telegram, u.userId).catch(() => {});
+      }
+
+      const trialEnds = u.trialEndsAt ? new Date(u.trialEndsAt).getTime() : 0;
+      const subEnds = u.subscriptionEndsAt ? new Date(u.subscriptionEndsAt).getTime() : 0;
+      const pending = (u.pendingSubscriptionMonths || 0) > 0;
+      const active = pending || (trialEnds && now < trialEnds) || (subEnds && now < subEnds);
+
+      if (trialEnds && now < trialEnds) {
+        const msLeft = trialEnds - now;
+        if (msLeft <= BILLING.trialReminder8hMsBeforeEnd && msLeft > BILLING.trialReminder2hMsBeforeEnd && !u.trialReminder8hSentAt) {
+          const mark = await BotUser.updateOne(
+            { _id: u._id, trialReminder8hSentAt: null },
+            { $set: { trialReminder8hSentAt: new Date() } }
+          ).catch(() => null);
+          const did = !!(mark && (mark.modifiedCount === 1 || mark.nModified === 1));
+          if (did) {
+            const msg =
+              `Heads up: your trial is running out (${formatTrialTimeLeft(msLeft)} left).\n\n` +
+              'Tap “Pay 100 Sujicards” or “Pay 100 Stars” to stay with Sujini in the sky.';
+            outboundQueue.enqueue(() => safeSendMessage(telegram, u.userId, msg, pay100Keyboard(), 'trial_reminder_1'));
+          }
+        }
+        if (msLeft <= BILLING.trialReminder2hMsBeforeEnd && msLeft > 0 && !u.trialReminder2hSentAt) {
+          const mark = await BotUser.updateOne(
+            { _id: u._id, trialReminder2hSentAt: null },
+            { $set: { trialReminder2hSentAt: new Date() } }
+          ).catch(() => null);
+          const did = !!(mark && (mark.modifiedCount === 1 || mark.nModified === 1));
+          if (did) {
+            const msg =
+              `Urgent: your trial ends very soon (${formatTrialTimeLeft(msLeft)} left).\n\n` +
+              'Tap “Pay 100 Sujicards” or “Pay 100 Stars” to stay with Sujini in the sky.';
+            outboundQueue.enqueue(() => safeSendMessage(telegram, u.userId, msg, pay100Keyboard(), 'trial_reminder_2'));
+          }
+        }
+      }
+
+      if (subEnds && now < subEnds) {
+        const msLeft = subEnds - now;
+        if (msLeft <= BILLING.subReminder3dMsBeforeEnd && msLeft > BILLING.subReminder1dMsBeforeEnd && !u.expiryReminder3dSentAt) {
+          const mark = await BotUser.updateOne(
+            { _id: u._id, expiryReminder3dSentAt: null },
+            { $set: { expiryReminder3dSentAt: new Date() } }
+          ).catch(() => null);
+          const did = !!(mark && (mark.modifiedCount === 1 || mark.nModified === 1));
+          if (did) {
+            const msg =
+              `Your subscription ends on ${formatHumanDate(new Date(subEnds))}.\n\n` +
+              'Tap “Pay 100 Sujicards” or “Pay 100 Stars” to renew and keep Sujini scouting for you.';
+            outboundQueue.enqueue(() => safeSendMessage(telegram, u.userId, msg, pay100Keyboard(), 'sub_reminder_3d'));
+          }
+        }
+        if (msLeft <= BILLING.subReminder1dMsBeforeEnd && msLeft > 0 && !u.expiryReminder1dSentAt) {
+          const mark = await BotUser.updateOne(
+            { _id: u._id, expiryReminder1dSentAt: null },
+            { $set: { expiryReminder1dSentAt: new Date() } }
+          ).catch(() => null);
+          const did = !!(mark && (mark.modifiedCount === 1 || mark.nModified === 1));
+          if (did) {
+            const msg =
+              `⏳ 1 day left.\n\n` +
+              `Your subscription ends on ${formatHumanDate(new Date(subEnds))}.\n\n` +
+              'Tap “Pay 100 Sujicards” or “Pay 100 Stars” to renew and keep Sujini scouting for you.';
+            outboundQueue.enqueue(() => safeSendMessage(telegram, u.userId, msg, pay100Keyboard(), 'sub_reminder_1d'));
+          }
+        }
+      }
+
+      if (!active && !pending && !u.removedAt && (trialEnds || subEnds)) {
         let allRemoved = true;
         for (const cid of requiredIds) {
-          const res = await removeUserFromChat(telegram, cid, u.userId, 'sweep_remove_banned');
+          const res = await removeUserFromChat(telegram, cid, u.userId, 'sweep_remove_expired');
           if (!res.ok) allRemoved = false;
         }
         if (allRemoved) {
-          await BotUser.updateOne({ _id: u._id }, { $set: { removedAt: new Date() } });
+          const mark = await BotUser.updateOne(
+            { _id: u._id, removedAt: null },
+            { $set: { removedAt: new Date() } }
+          ).catch(() => null);
+          const did = !!(mark && (mark.modifiedCount === 1 || mark.nModified === 1));
+          if (did) {
+            const msg =
+              '🔥 🦅 Your access has expired, so you’ve been removed from the community chats.\n\n' +
+              'Tap “Pay 100 Sujicards” or “Pay 100 Stars” to reactivate your subscription.';
+            outboundQueue.enqueue(() => safeSendMessage(telegram, u.userId, msg, pay100Keyboard(), 'expired_removed'));
+          }
         }
       }
-      continue;
     }
-
-    if ((u.pendingSubscriptionMonths || 0) > 0) {
-      await tryActivatePendingSubscription(s, telegram, u.userId).catch(() => {});
-    }
-
-    if (!u.mandatoryJoinedAt && u.joinPromptMessageId) {
-      await finalizeOnboardingIfJoined(s, telegram, u.userId).catch(() => {});
-    }
-
-    const trialEnds = u.trialEndsAt ? new Date(u.trialEndsAt).getTime() : 0;
-    const subEnds = u.subscriptionEndsAt ? new Date(u.subscriptionEndsAt).getTime() : 0;
-    const pending = (u.pendingSubscriptionMonths || 0) > 0;
-    const active = pending || (trialEnds && now < trialEnds) || (subEnds && now < subEnds);
-
-    if (trialEnds && now < trialEnds) {
-      const msLeft = trialEnds - now;
-      if (msLeft <= BILLING.trialReminder8hMsBeforeEnd && msLeft > BILLING.trialReminder2hMsBeforeEnd && !u.trialReminder8hSentAt) {
-        await BotUser.updateOne({ _id: u._id }, { $set: { trialReminder8hSentAt: new Date() } });
-        const msg1 = BILLING.testMode
-          ? 'Heads up: your trial is running out (test mode).'
-          : 'Heads up: your trial is running out.';
-        const msg2 = BILLING.testMode
-          ? 'Keep flying with Sujini. Pay 100 Stars to continue.'
-          : 'Keep flying with Sujini. Pay 100 Stars to continue.';
-        outboundQueue.enqueue(() => safeSendMessage(telegram, u.userId, msg1, null, 'trial_reminder_1a'));
-        outboundQueue.enqueue(() => safeSendMessage(telegram, u.userId, msg2, pay100Keyboard(), 'trial_reminder_1b'));
-      }
-      if (msLeft <= BILLING.trialReminder2hMsBeforeEnd && msLeft > 0 && !u.trialReminder2hSentAt) {
-        await BotUser.updateOne({ _id: u._id }, { $set: { trialReminder2hSentAt: new Date() } });
-        const msg1 = BILLING.testMode
-          ? 'Urgent: your trial ends very soon (test mode).'
-          : 'Urgent: your trial ends very soon.';
-        const msg2 = BILLING.testMode
-          ? 'Tap Pay 100 Stars to stay in the sky.'
-          : 'Tap Pay 100 Stars to stay in the sky.';
-        outboundQueue.enqueue(() => safeSendMessage(telegram, u.userId, msg1, null, 'trial_reminder_2a'));
-        outboundQueue.enqueue(() => safeSendMessage(telegram, u.userId, msg2, pay100Keyboard(), 'trial_reminder_2b'));
-      }
-    }
-
-    if (subEnds && now < subEnds) {
-      const msLeft = subEnds - now;
-      if (msLeft <= BILLING.subReminder3dMsBeforeEnd && msLeft > 0 && !u.expiryReminder3dSentAt) {
-        await BotUser.updateOne({ _id: u._id }, { $set: { expiryReminder3dSentAt: new Date() } });
-        const msg1 = BILLING.testMode
-          ? 'Your subscription will end soon (test mode).'
-          : 'Your subscription will end soon.';
-        const msg2 = BILLING.testMode
-          ? 'Renew with 100 Stars and keep Sujini scouting for you.'
-          : 'Renew with 100 Stars and keep Sujini scouting for you.';
-        outboundQueue.enqueue(() => safeSendMessage(telegram, u.userId, msg1, null, 'sub_reminder_a'));
-        outboundQueue.enqueue(() => safeSendMessage(telegram, u.userId, msg2, pay100Keyboard(), 'sub_reminder_b'));
-      }
-    }
-
-    if (!active && !pending && !u.removedAt && (trialEnds || subEnds)) {
-      let allRemoved = true;
-      for (const cid of requiredIds) {
-        const res = await removeUserFromChat(telegram, cid, u.userId, 'sweep_remove_expired');
-        if (!res.ok) allRemoved = false;
-      }
-      if (allRemoved) {
-        await BotUser.updateOne({ _id: u._id }, { $set: { removedAt: new Date() } });
-        outboundQueue.enqueue(() => safeSendMessage(telegram, u.userId, 'Your access has expired, so you’ve been removed from the community chats.', null, 'expired_removed_a'));
-        outboundQueue.enqueue(() => safeSendMessage(telegram, u.userId, 'If you want back in, tap Pay 100 Stars to rejoin.', pay100Keyboard(), 'expired_removed_b'));
-      }
-    }
+  } finally {
+    membershipSweepRunning = false;
   }
 }
 
@@ -2319,6 +3449,7 @@ export function setupHandlers(bot) {
   ensureApprovedChatCacheLoaded().catch(() => {});
 
   bot.catch((err, ctx) => {
+    if (isStaleCallbackQueryError(err) || isMessageNotModifiedError(err)) return;
     try {
       if (ctx?.callbackQuery) {
         ctx.answerCbQuery('❌ Something went wrong').catch(() => {});
@@ -2328,15 +3459,55 @@ export function setupHandlers(bot) {
   });
 
   bot.use(async (ctx, next) => {
+    if (!ctx?.callbackQuery) return next();
+    let answered = false;
+    const orig = ctx.answerCbQuery?.bind(ctx);
+    if (orig) {
+      ctx.answerCbQuery = async (...args) => {
+        answered = true;
+        try {
+          return await orig(...args);
+        } catch (err) {
+          if (isStaleCallbackQueryError(err) || isMessageNotModifiedError(err)) return;
+          throw err;
+        }
+      };
+    }
+
+    const timer = setTimeout(() => {
+      if (answered) return;
+      try {
+        ctx.answerCbQuery().catch(() => {});
+      } catch {}
+    }, 1500);
+    if (timer?.unref) timer.unref();
+
+    try {
+      return await next();
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  bot.use(async (ctx, next) => {
     try {
       const msg = ctx?.message || null;
       const messageId = msg?.message_id || null;
       const chatIdStr = ctx?.chat?.id?.toString?.() || null;
       if (!msg || !messageId || !chatIdStr) return next();
+      if (!isGroupChatType(ctx?.chat?.type)) return next();
       if (!isServiceSpamMessage(msg)) return next();
       await ensureApprovedChatCacheLoaded();
-      const approved = approvedChatCache.groups.has(chatIdStr) || approvedChatCache.channels.has(chatIdStr);
+      const approved = approvedChatCache.groups.has(chatIdStr);
       if (!approved) return next();
+      if (Array.isArray(msg.new_chat_members) && msg.new_chat_members.length) {
+        const s = await getSettings().catch(() => null);
+        if (s) {
+          for (const member of msg.new_chat_members) {
+            await enforceMandatoryJoinGate(s, ctx.telegram, chatIdStr, member, 'service_join').catch(() => {});
+          }
+        }
+      }
       await safeDeleteMessage(ctx.telegram, ctx.chat.id, messageId, 'delete_service_spam');
       return;
     } catch {}
@@ -2346,13 +3517,24 @@ export function setupHandlers(bot) {
   bot.use((ctx, next) => authorizedGroupMiddleware(ctx, next));
 
   bot.command('start', handleStart);
+  bot.command('balance', handleBalanceCommand);
+  bot.command('ref', handleReferralCommand);
+  bot.command('leaderboard', handleLeaderboardCommand);
   bot.command('ban', handleBanCommand);
   bot.command('unban', handleUnbanCommand);
   bot.on('message', handleMessage);
   bot.on('pre_checkout_query', async (ctx) => { try { await ctx.answerPreCheckoutQuery(true); } catch {} });
 
   bot.action('back_to_main', handleStart);
+  bot.action('ui_noop', async (ctx) => { try { await ctx.answerCbQuery('🔥🦅', { show_alert: false }); } catch {} });
+  bot.action('user_home', handleUserStart);
+  bot.action('user_balance', handleBalanceCommand);
+  bot.action('user_ref', handleReferralCommand);
+  bot.action('user_leaderboard', handleLeaderboardCommand);
   bot.action('subscribe_100', handleSubscribe);
+  bot.action('subscribe_cards', handleSubscribeWithSujicards);
+  bot.action(/^subscribe_cards_confirm_(.+)$/i, handleSubscribeWithSujicardsConfirm);
+  bot.action(/^subscribe_cards_cancel_(.+)$/i, handleSubscribeWithSujicardsCancel);
 
   bot.action('accounts', handleAccounts);
   bot.action('add_account', handleAddAccount);
@@ -2414,6 +3596,7 @@ export function setupHandlers(bot) {
 
   bot.action('broadcast_menu', handleBroadcastMenu);
   bot.action('broadcast_start', handleBroadcastStart);
+  bot.action('broadcast_start_expired', handleBroadcastStartExpired);
 
   bot.action('settings_menu', handleSettingsMenu);
   bot.action('toggle_posting', handleTogglePosting);
@@ -2428,6 +3611,7 @@ export function setupHandlers(bot) {
 
   bot.action('start_all', handleStartAll);
   bot.action('stop_all', handleStopAll);
+  bot.action('toggle_all', handleToggleAll);
 
   startPoller();
 }
@@ -2448,5 +3632,9 @@ export async function seedOnStartup() {
 
 export function startSchedulers(telegram) {
   membershipSweep(telegram).catch(() => {});
-  setInterval(() => membershipSweep(telegram).catch(() => {}), 5 * 1000);
+  const sweepTimer = setInterval(() => membershipSweep(telegram).catch(() => {}), 60 * 1000);
+  if (sweepTimer?.unref) sweepTimer.unref();
+  const ANNOUNCE_MS = 30 * 60 * 1000;
+  const t = setInterval(() => announceListenerGroupsProgress(telegram).catch(() => {}), ANNOUNCE_MS);
+  if (t?.unref) t.unref();
 }

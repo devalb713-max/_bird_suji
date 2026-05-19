@@ -1,8 +1,9 @@
 import { Api } from 'telegram/tl/index.js';
 import { NewMessage } from 'telegram/events/index.js';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { Telegram } from 'telegraf';
-import { Account, Admin, ApprovedChat, BotSettings, BotChat, MessageTemplate, QueuedPost, GroupLink, AiQueueMessage } from '../models/db.js';
+import { Account, Admin, ApprovedChat, BotSettings, BotChat, MessageTemplate, QueuedPost, GroupLink, AiQueueMessage, PostDedupe } from '../models/db.js';
 import {
   createClient,
   extractUsernameFromLink,
@@ -25,6 +26,71 @@ const botTelegram = new Telegram(process.env.BOT_TOKEN);
 let _promptTemplate = null;
 let _logoBytes = null;
 let _jobTargetsCache = { loadedAt: 0, ids: [] };
+
+const LISTENER_TRACE = process.env.LISTENER_TRACE === '1';
+const LISTENER_TRACE_TEXT_CHARS = Math.max(80, Math.min(2000, Number(process.env.LISTENER_TRACE_TEXT_CHARS || 700)));
+
+//#region debug-point listener-missing-messages reporter
+const DEBUG_SERVER_URL = process.env.DEBUG_SERVER_URL || null;
+const DEBUG_SESSION_ID = process.env.DEBUG_SESSION_ID || 'listener-missing-messages';
+const DEBUG_ENABLED = !!DEBUG_SERVER_URL;
+
+async function dbg(event, payload) {
+  if (!DEBUG_ENABLED) return;
+  try {
+    await fetch(DEBUG_SERVER_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: DEBUG_SESSION_ID,
+        ts: new Date().toISOString(),
+        event,
+        payload,
+      }),
+    });
+  } catch {}
+}
+//#endregion debug-point listener-missing-messages reporter
+
+function truncateTraceText(value, maxChars = LISTENER_TRACE_TEXT_CHARS) {
+  const s = value == null ? '' : value.toString();
+  if (s.length <= maxChars) return s;
+  let cut = s.slice(0, maxChars);
+  const last = cut.charCodeAt(cut.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1);
+  return `${cut}…`;
+}
+
+function normalizeMessageChatId(rawChatId) {
+  const s = rawChatId == null ? '' : rawChatId.toString();
+  if (!s) return null;
+  if (s.startsWith('-100')) return `tg:${s.slice(4)}`;
+  if (s.startsWith('-')) return `tg:${s.slice(1)}`;
+  return s;
+}
+
+function extractGroupIdFromChatId(rawChatId) {
+  const s = rawChatId == null ? '' : rawChatId.toString();
+  if (!s) return null;
+  return s;
+}
+
+function safeTraceStringify(value) {
+  try {
+    return JSON.stringify(value, (k, v) => {
+      if (typeof v === 'string') return truncateTraceText(v);
+      return v;
+    });
+  } catch {
+    return '"[unserializable]"';
+  }
+}
+
+function listenerTrace(event, payload) {
+  if (!LISTENER_TRACE) return;
+  const suffix = payload === undefined ? '' : ` ${safeTraceStringify(payload)}`;
+  console.log(`[ListenerTrace] ${event}${suffix}`);
+}
 
 const FALLBACK_KEYWORDS = [
   'hiring', 'hire', 'recruit', 'recruiting',
@@ -72,6 +138,28 @@ async function notifyAllAdmins(text) {
   const admins = await Admin.find({ userId: { $ne: null } }, { userId: 1 }).lean();
   const ids = [...new Set(admins.map(a => a.userId).filter(Boolean))];
   await Promise.allSettled(ids.map((id) => botTelegram.sendMessage(id, text)));
+}
+
+function escapeHtml(value) {
+  return (value ?? '').toString()
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+}
+
+function normalizeForContentDedupe(text) {
+  return (text ?? '')
+    .toString()
+    .replaceAll('\u200b', '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function contentHash(text) {
+  const normalized = normalizeForContentDedupe(text);
+  return createHash('sha256').update(normalized).digest('hex');
 }
 
 async function callOpenAI(prompt) {
@@ -155,6 +243,10 @@ async function callOpenAIBatch(prompt) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error('OPENAI_API_KEY missing');
   const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  listenerTrace('llm.request', { provider: 'openai', model, endpoint: '/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0 });
+  //#region debug-point listener-missing-messages llm.request
+  await dbg('llm.request', { provider: 'openai', model, endpoint: '/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0 });
+  //#endregion debug-point listener-missing-messages llm.request
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
@@ -167,8 +259,16 @@ async function callOpenAIBatch(prompt) {
   if (!res.ok) throw new Error(`openai_http_${res.status}`);
   const data = await res.json();
   const out = data?.choices?.[0]?.message?.content ?? '';
+  listenerTrace('llm.response', { provider: 'openai', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null });
+  //#region debug-point listener-missing-messages llm.response
+  await dbg('llm.response', { provider: 'openai', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null });
+  //#endregion debug-point listener-missing-messages llm.response
   const parsed = parseBatchDecisions(out);
   if (!parsed) throw new Error('openai_batch_parse');
+  listenerTrace('llm.parsed', { provider: 'openai', rows: parsed.length });
+  //#region debug-point listener-missing-messages llm.parsed
+  await dbg('llm.parsed', { provider: 'openai', rows: parsed.length });
+  //#endregion debug-point listener-missing-messages llm.parsed
   return parsed;
 }
 
@@ -176,6 +276,10 @@ async function callOpenRouterBatch(prompt) {
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) throw new Error('OPENROUTER_API_KEY missing');
   const model = process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct:free';
+  listenerTrace('llm.request', { provider: 'openrouter', model, endpoint: '/api/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0 });
+  //#region debug-point listener-missing-messages llm.request
+  await dbg('llm.request', { provider: 'openrouter', model, endpoint: '/api/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0 });
+  //#endregion debug-point listener-missing-messages llm.request
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
@@ -188,8 +292,16 @@ async function callOpenRouterBatch(prompt) {
   if (!res.ok) throw new Error(`openrouter_http_${res.status}`);
   const data = await res.json();
   const out = data?.choices?.[0]?.message?.content ?? '';
+  listenerTrace('llm.response', { provider: 'openrouter', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null });
+  //#region debug-point listener-missing-messages llm.response
+  await dbg('llm.response', { provider: 'openrouter', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null });
+  //#endregion debug-point listener-missing-messages llm.response
   const parsed = parseBatchDecisions(out);
   if (!parsed) throw new Error('openrouter_batch_parse');
+  listenerTrace('llm.parsed', { provider: 'openrouter', rows: parsed.length });
+  //#region debug-point listener-missing-messages llm.parsed
+  await dbg('llm.parsed', { provider: 'openrouter', rows: parsed.length });
+  //#endregion debug-point listener-missing-messages llm.parsed
   return parsed;
 }
 
@@ -216,6 +328,19 @@ async function classifyHiringIntentBatch(items) {
     `Batch items (JSON):\n` +
     `${JSON.stringify(items)}\n`;
 
+  listenerTrace('ai.batch', {
+    items: items.map(i => ({ id: i.id, text: truncateTraceText(i.text, 240) })),
+    itemsCount: items.length,
+    promptChars: prompt.length,
+  });
+  //#region debug-point listener-missing-messages ai.batch
+  await dbg('ai.batch', {
+    items: items.map(i => ({ id: i.id, text: truncateTraceText(i.text, 240) })),
+    itemsCount: items.length,
+    promptChars: prompt.length,
+  });
+  //#endregion debug-point listener-missing-messages ai.batch
+
   try {
     const rows = await callOpenAIBatch(prompt);
     await BotSettings.updateOne({ _id: settings._id }, { $set: { aiConsecutiveFails: 0 } });
@@ -241,6 +366,10 @@ async function classifyHiringIntentBatch(items) {
           await notifyAllAdmins('AI batch classification has failed repeatedly (possible credits exhausted). Falling back to keyword matching.');
         }
       }
+      listenerTrace('ai.fallback', { decidedBy: 'keyword', itemsCount: items.length });
+      //#region debug-point listener-missing-messages ai.fallback
+      await dbg('ai.fallback', { decidedBy: 'keyword', itemsCount: items.length });
+      //#endregion debug-point listener-missing-messages ai.fallback
       return { decidedBy: 'keyword', rows: items.map(i => ({ id: i.id, keep: keywordMatchHiringIntent(i.text) })) };
     }
   }
@@ -283,20 +412,43 @@ async function classifyHiringIntent(text) {
 
 function formatCandidatePost(fields) {
   const lines = [];
-  if (fields.senderName) lines.push(fields.senderName);
-  if (fields.senderId) lines.push(fields.senderId);
-  if (fields.groupLink) lines.push(fields.groupLink);
-  if (fields.messageLink) lines.push(fields.messageLink);
-  if (fields.senderUsername) lines.push(fields.senderUsername);
-  const suffix = lines.length ? `\n\n${lines.join('\n')}` : '';
-  return `${fields.message}${suffix}`;
+  if (fields.senderName) lines.push(`Name: ${fields.senderName}`);
+  if (fields.senderId) lines.push(`User ID: ${fields.senderId}`);
+  if (fields.senderUsername) lines.push(`Username: ${fields.senderUsername}`);
+  const suffix = lines.length ? `\n\n${lines.map(escapeHtml).join('\n')}` : '';
+  return `<blockquote>${escapeHtml(fields.message)}</blockquote>${suffix}`;
 }
 
-async function sendBotMessageWithRetry(chatId, text) {
+function buildCandidateButtons(fields) {
+  const rows = [];
+
+  const senderId = fields?.senderId ? fields.senderId.toString().trim() : '';
+  if (senderId) rows.push([{ text: '👤 Contact', url: `tg://user?id=${senderId}` }]);
+
+  const uname = fields?.senderUsername ? fields.senderUsername.toString().trim().replace(/^@/, '') : '';
+  if (uname) rows.push([{ text: `@${uname}`, url: `https://t.me/${uname}` }]);
+
+  const messageLink = fields?.messageLink ? fields.messageLink.toString().trim() : '';
+  if (messageLink) rows.push([{ text: '💬 Message', url: messageLink }]);
+
+  const groupLink = fields?.groupLink ? fields.groupLink.toString().trim() : '';
+  if (groupLink) rows.push([{ text: '👥 Group', url: groupLink }]);
+
+  if (!rows.length) return null;
+  return { inline_keyboard: rows };
+}
+
+function buildCandidatePost(fields) {
+  const text = formatCandidatePost(fields);
+  const reply_markup = buildCandidateButtons(fields);
+  return { text, reply_markup };
+}
+
+async function sendBotMessageWithRetry(chatId, text, reply_markup = null) {
   const max = 3;
   for (let attempt = 1; attempt <= max; attempt++) {
     try {
-      await botTelegram.sendMessage(chatId, text, { disable_web_page_preview: true });
+      await botTelegram.sendMessage(chatId, text, { disable_web_page_preview: true, parse_mode: 'HTML', reply_markup: reply_markup || undefined });
       return true;
     } catch (err) {
       const retryAfter = err?.parameters?.retry_after;
@@ -309,6 +461,12 @@ async function sendBotMessageWithRetry(chatId, text) {
     }
   }
   return false;
+}
+
+async function setClientOnline(client) {
+  try {
+    await client.invoke(new Api.account.UpdateStatus({ offline: false }));
+  } catch {}
 }
 
 let _aiBatcherStarted = false;
@@ -334,6 +492,7 @@ async function enqueueAiMessage(doc) {
     senderName: doc?.senderName || null,
     senderUsername: doc?.senderUsername || null,
     senderId: doc?.senderId || null,
+    groupId: doc?.groupId || null,
     groupLink: doc?.groupLink || null,
     messageLink: doc?.messageLink || null,
     status: 'pending',
@@ -343,10 +502,18 @@ async function enqueueAiMessage(doc) {
 
   if (filter) {
     await AiQueueMessage.updateOne(filter, { $setOnInsert: setOnInsert }, { upsert: true }).catch(() => {});
+    listenerTrace('queue.enqueue', { chatId, messageId, textPreview: truncateTraceText(setOnInsert.text, 180) });
+    //#region debug-point listener-missing-messages queue.enqueue
+    await dbg('queue.enqueue', { chatId, messageId, textPreview: truncateTraceText(setOnInsert.text, 220) });
+    //#endregion debug-point listener-missing-messages queue.enqueue
     return;
   }
 
   await AiQueueMessage.create(setOnInsert).catch(() => {});
+  listenerTrace('queue.enqueue', { chatId, messageId: null, textPreview: truncateTraceText(setOnInsert.text, 180) });
+  //#region debug-point listener-missing-messages queue.enqueue
+  await dbg('queue.enqueue', { chatId, messageId: null, textPreview: truncateTraceText(setOnInsert.text, 220) });
+  //#endregion debug-point listener-missing-messages queue.enqueue
 }
 
 async function releaseStuckAiBatches() {
@@ -386,12 +553,21 @@ async function processAiBatchOnce() {
 
     const settings = await getSettings();
     const targets = await getJobTargetChatIds();
+    listenerTrace('queue.claimed', { batchId, docs: docs.length, targets: targets.length, botPostingEnabled: !!settings.botPostingEnabled });
+    //#region debug-point listener-missing-messages queue.claimed
+    await dbg('queue.claimed', { batchId, docs: docs.length, targets: targets.length, botPostingEnabled: !!settings.botPostingEnabled });
+    //#endregion debug-point listener-missing-messages queue.claimed
 
     const aiMaxChars = Math.max(200, Math.min(4000, Number(process.env.AI_BATCH_TEXT_CHARS || 1400)));
     const items = docs.map(d => ({ id: d._id.toString(), text: truncateForAi(d.text, aiMaxChars) }));
     const { decidedBy, rows } = await classifyHiringIntentBatch(items);
     const decisionMap = new Map(rows.map(r => [r.id, r.keep]));
     const decidedAt = new Date();
+    const kept = rows.filter(r => r.keep).length;
+    listenerTrace('ai.decisions', { batchId, decidedBy, rows: rows.length, kept });
+    //#region debug-point listener-missing-messages ai.decisions
+    await dbg('ai.decisions', { batchId, decidedBy, rows: rows.length, kept });
+    //#endregion debug-point listener-missing-messages ai.decisions
 
     for (const doc of docs) {
       const id = doc._id.toString();
@@ -404,19 +580,48 @@ async function processAiBatchOnce() {
             senderName: doc.senderName,
             senderUsername: doc.senderUsername,
             senderId: doc.senderId,
+            groupId: doc.groupId || null,
             groupLink: doc.groupLink,
             messageLink: doc.messageLink,
           };
 
           if (settings.botPostingEnabled) {
-            const out = formatCandidatePost(payload);
+            const out = buildCandidatePost(payload);
             let anySent = false;
             for (const target of targets) {
-              const sent = await sendBotMessageWithRetry(target, out);
+              const groupKey = doc.chatId || doc.groupId || '';
+              const txtKey = `txt:${groupKey}::${contentHash(doc.text)}::${target}`;
+              const insertedTxt = await PostDedupe.create({
+                key: txtKey,
+                sourceChatId: doc.chatId || null,
+                sourceMessageId: doc.messageId ?? null,
+                targetChatId: target.toString(),
+              }).then(() => true).catch(() => false);
+              if (!insertedTxt) continue;
+
+              const srcKey = `src:${doc.chatId || ''}::${doc.messageId ?? ''}::${target}`;
+              if (doc.chatId && doc.messageId != null) {
+                await PostDedupe.create({
+                  key: srcKey,
+                  sourceChatId: doc.chatId || null,
+                  sourceMessageId: doc.messageId ?? null,
+                  targetChatId: target.toString(),
+                }).catch(() => {});
+              }
+
+              const sent = await sendBotMessageWithRetry(target, out.text, out.reply_markup);
               if (sent) anySent = true;
             }
+            listenerTrace('post.attempt', { batchId, decidedBy, keep: true, targets: targets.length, sentAny: anySent, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
+            //#region debug-point listener-missing-messages post.attempt
+            await dbg('post.attempt', { batchId, decidedBy, keep: true, targets: targets.length, sentAny: anySent, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
+            //#endregion debug-point listener-missing-messages post.attempt
             if (!anySent) await QueuedPost.create(payload).catch(() => {});
           } else {
+            listenerTrace('post.queued', { batchId, decidedBy, keep: true, botPostingEnabled: false, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
+            //#region debug-point listener-missing-messages post.queued
+            await dbg('post.queued', { batchId, decidedBy, keep: true, botPostingEnabled: false, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
+            //#endregion debug-point listener-missing-messages post.queued
             await QueuedPost.create(payload).catch(() => {});
           }
         }
@@ -452,7 +657,7 @@ async function processAiBatchOnce() {
 function startAiBatchProcessor() {
   if (_aiBatcherStarted) return;
   _aiBatcherStarted = true;
-  const intervalMs = Math.max(60_000, Number(process.env.AI_BATCH_INTERVAL_MS || 10 * 60 * 1000));
+  const intervalMs = Math.max(10_000, Number(process.env.AI_BATCH_INTERVAL_MS || 10 * 60 * 1000));
   processAiBatchOnce().catch(() => {});
   _aiBatcherTimer = setInterval(() => processAiBatchOnce().catch(() => {}), intervalMs);
   if (_aiBatcherTimer?.unref) _aiBatcherTimer.unref();
@@ -462,10 +667,15 @@ async function getJobTargetChatIds() {
   const stale = !_jobTargetsCache.loadedAt || (Date.now() - _jobTargetsCache.loadedAt) > 60 * 1000;
   if (!stale && Array.isArray(_jobTargetsCache.ids)) return _jobTargetsCache.ids;
 
+  const settings = await getSettings();
+  const configured = settings?.jobsTargetChatId ? Number(settings.jobsTargetChatId) : null;
+  if (configured && Number.isFinite(configured)) {
+    _jobTargetsCache = { loadedAt: Date.now(), ids: [configured] };
+    return _jobTargetsCache.ids;
+  }
+
   const rows = await ApprovedChat.find({ type: { $ne: 'channel' } }, { chatId: 1 }).lean();
-  const ids = rows
-    .map(r => Number(r.chatId))
-    .filter(n => Number.isFinite(n));
+  const ids = [...new Set(rows.map(r => Number(r.chatId)).filter(n => Number.isFinite(n)))];
   _jobTargetsCache = { loadedAt: Date.now(), ids };
   return ids;
 }
@@ -596,30 +806,59 @@ async function runListener(accountId, flag) {
     let fatalAuthErr = null;
     const queue = [];
     let processing = false;
+    let lastListenerEventAt = Date.now();
+    let lastDbSeenAt = 0;
 
-    const buildMessageLink = async (message) => {
-      try {
-        const chat = await message.getChat();
-        if (chat?.username) return `https://t.me/${chat.username}/${message.id}`;
-        const chatIdStr = (message.chatId || chat?.id)?.toString?.() || '';
-        if (chatIdStr.startsWith('-100')) return `https://t.me/c/${chatIdStr.slice(4)}/${message.id}`;
-        if (chatIdStr.startsWith('-')) return `https://t.me/c/${chatIdStr.slice(1)}/${message.id}`;
-        return null;
-      } catch {
-        return null;
-      }
+    const markListenerConnected = async () => {
+      await Account.updateOne(
+        { _id: accountId },
+        { $set: { listenerConnectedAt: new Date(), listenerLastError: null } }
+      ).catch(() => {});
     };
 
-    const buildGroupLink = async (message) => {
-      try {
-        const chat = await message.getChat();
-        if (chat?.username) return `https://t.me/${chat.username}`;
-        const chatIdStr = (message.chatId || chat?.id)?.toString?.() || '';
-        if (chatIdStr.startsWith('-100')) return `https://t.me/c/${chatIdStr.slice(4)}`;
-        return null;
-      } catch {
-        return null;
-      }
+    const markListenerSeen = async ({ chatId, messageId }) => {
+      const nowMs = Date.now();
+      if (nowMs - lastDbSeenAt < 15000) return;
+      lastDbSeenAt = nowMs;
+      await Account.updateOne(
+        { _id: accountId },
+        {
+          $set: {
+            listenerLastSeenAt: new Date(),
+            listenerLastChatId: chatId ? chatId.toString() : null,
+            listenerLastMessageId: messageId ?? null,
+          },
+        }
+      ).catch(() => {});
+    };
+
+    const getBestKnownGroupJoinLink = (rawChatId) => {
+      const s = rawChatId == null ? '' : rawChatId.toString();
+      if (!s) return null;
+      const internal = s.startsWith('-100') ? s.slice(4) : s.startsWith('-') ? s.slice(1) : s;
+      const groups = getGroups(accountId) || [];
+      const hit = groups.find(g => {
+        const id = g?.id?.toString?.() || '';
+        if (!id) return false;
+        return id === internal || id === s || id === `-100${internal}` || id === `-${internal}`;
+      });
+      const link = hit?.link ? hit.link.toString() : null;
+      return link || null;
+    };
+
+    const buildGroupLink = (chat, rawChatId) => {
+      const uname = chat?.username ? chat.username.toString().trim() : '';
+      if (uname) return `https://t.me/${uname.replace(/^@/, '')}`;
+      return getBestKnownGroupJoinLink(rawChatId);
+    };
+
+    const buildMessageLink = (chat, rawChatId, messageId) => {
+      if (!messageId) return null;
+      const uname = chat?.username ? chat.username.toString().trim() : '';
+      if (uname) return `https://t.me/${uname.replace(/^@/, '')}/${messageId}`;
+      const s = rawChatId == null ? '' : rawChatId.toString();
+      if (!s.startsWith('-100')) return null;
+      return `https://t.me/c/${s.slice(4)}/${messageId}`;
     };
 
     const processQueue = async () => {
@@ -636,11 +875,14 @@ async function runListener(accountId, flag) {
           const senderName = [sender?.firstName, sender?.lastName].filter(Boolean).join(' ') || null;
           const senderUsername = sender?.username ? `@${sender.username}` : null;
           const senderId = sender?.id?.toString?.() || message.senderId?.toString?.() || null;
-          const groupLink = await buildGroupLink(message);
-          const messageLink = await buildMessageLink(message);
-
-          const chatId = (message.chatId || (await message.getChat().catch(() => null))?.id)?.toString?.() || null;
+          const chat = await message.getChat().catch(() => null);
+          const rawChatId = (message.chatId || chat?.id)?.toString?.() || null;
           const messageId = Number.isFinite(message.id) ? message.id : null;
+          const groupLink = buildGroupLink(chat, rawChatId);
+          const messageLink = buildMessageLink(chat, rawChatId, messageId);
+
+          const chatId = normalizeMessageChatId(rawChatId);
+          const groupId = extractGroupIdFromChatId(rawChatId);
           await enqueueAiMessage({
             accountId: accountId.toString(),
             chatId,
@@ -649,6 +891,7 @@ async function runListener(accountId, flag) {
             senderName,
             senderUsername,
             senderId,
+            groupId,
             groupLink,
             messageLink,
           });
@@ -667,14 +910,51 @@ async function runListener(accountId, flag) {
         await Account.updateOne({ _id: accountId }, { session: refreshed });
       }
       await client.getMe();
+      await client.invoke(new Api.updates.GetState()).catch(() => {});
+      await client.getDialogs({ limit: 20 }).catch(() => {});
+      await setClientOnline(client);
+      await markListenerConnected();
+      //#region debug-point listener-missing-messages listener.connected
+      await dbg('listener.connected', { accountId: accountId.toString(), groupsInDb: (account.groups || []).length });
+      //#endregion debug-point listener-missing-messages listener.connected
 
       client.addEventHandler(
         async (event) => {
           try {
             const message = event?.message;
-            if (!message || message.out) return;
-            if (!event.isGroup || event.isPrivate) return;
+            const chatId = (message?.chatId || (await message?.getChat?.().catch(() => null))?.id)?.toString?.() || null;
+            const messageId = Number.isFinite(message?.id) ? message.id : null;
+            const text = (message?.text || message?.message || '').toString();
+            const isGroup = !!event?.isGroup;
+            const isPrivate = !!event?.isPrivate;
+            const isOut = !!message?.out;
+
+            let dropReason = null;
+            if (!message) dropReason = 'no_message';
+            else if (isOut) dropReason = 'out';
+            else if (!isGroup) dropReason = 'not_group';
+            else if (isPrivate) dropReason = 'private';
+            else if (!text.trim()) dropReason = 'no_text';
+
+            lastListenerEventAt = Date.now();
+
+            //#region debug-point listener-missing-messages listener.new_message
+            await dbg('listener.new_message', {
+              accountId: accountId.toString(),
+              chatId,
+              messageId,
+              isGroup,
+              isPrivate,
+              isOut,
+              textChars: text.length,
+              textPreview: truncateTraceText(text, 260),
+              dropReason,
+            });
+            //#endregion debug-point listener-missing-messages listener.new_message
+
+            if (dropReason) return;
             queue.push(message);
+            markListenerSeen({ chatId: normalizeMessageChatId(chatId), messageId }).catch(() => {});
             processQueue().catch(() => {});
           } catch {}
         },
@@ -682,11 +962,41 @@ async function runListener(accountId, flag) {
       );
 
       while (flag.running && !fatalAuthErr) {
+        const idleMs = Date.now() - lastListenerEventAt;
+        if (idleMs >= 120000) {
+          //#region debug-point listener-missing-messages listener.idle
+          await dbg('listener.idle', { accountId: accountId.toString(), idleMs, queue: queue.length });
+          //#endregion debug-point listener-missing-messages listener.idle
+        }
+        try {
+          await client.getMe();
+          await client.invoke(new Api.updates.GetState()).catch(() => {});
+          await setClientOnline(client);
+          if (idleMs > 2 * 60 * 1000) {
+            await client.getDialogs({ limit: 20 }).catch(() => {});
+          }
+        } catch (err) {
+          if (isAuthError(err)) fatalAuthErr = err;
+          else {
+            await Account.updateOne({ _id: accountId }, { $set: { listenerLastError: err?.message?.toString?.() || 'listener_error' } }).catch(() => {});
+            try { await client.disconnect(); } catch {}
+            await sleep(2000 + Math.random() * 2000);
+            try {
+              await client.connect();
+              await client.getMe();
+              await client.invoke(new Api.updates.GetState()).catch(() => {});
+              await client.getDialogs({ limit: 20 }).catch(() => {});
+              await setClientOnline(client);
+              await markListenerConnected();
+            } catch {}
+          }
+        }
         await sleep(30000);
       }
 
     } catch (err) {
       if (isAuthError(err)) fatalAuthErr = err;
+      else await Account.updateOne({ _id: accountId }, { $set: { listenerLastError: err?.message?.toString?.() || 'listener_error' } }).catch(() => {});
       if (isFloodError(err)) await sleep(getFloodSeconds(err) * 1000);
       else await sleep(30000);
     } finally {
@@ -770,6 +1080,9 @@ async function joinGroupLink(client, link, retried = false) {
 async function runPreacher(accountId, flag) {
   const seed = await Account.findById(accountId, 'groups');
   if (seed) initGroups(accountId, seed.groups);
+  //#region debug-point listener-missing-messages preacher.start
+  await dbg('preacher.start', { accountId: accountId.toString(), groupsInDb: (seed?.groups || []).length });
+  //#endregion debug-point listener-missing-messages preacher.start
 
   while (flag.running) {
     const account = await Account.findById(accountId);
@@ -796,6 +1109,14 @@ async function runPreacher(accountId, flag) {
         const rotation = await getTemplateRotation(accountId);
         const groupsSnapshot = [...getGroups(accountId)];
         const canPreach = !!(rotation?.items?.length && groupsSnapshot.length);
+        //#region debug-point listener-missing-messages preacher.state
+        await dbg('preacher.state', {
+          accountId: accountId.toString(),
+          canPreach,
+          templates: rotation?.items?.length || 0,
+          groups: groupsSnapshot.length,
+        });
+        //#endregion debug-point listener-missing-messages preacher.state
         if (canPreach) {
           for (const group of groupsSnapshot) {
             if (!flag.running) break;

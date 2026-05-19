@@ -6,6 +6,9 @@ export default function launchBot(bot) {
         console.log(`✅ Bot @${info.username} connected`);
         bot.telegram.setMyCommands([
           { command: 'start', description: 'Open Sujini menu' },
+          { command: 'ref', description: 'Your referral link + stats' },
+          { command: 'balance', description: 'Your Sujicards + referrals' },
+          { command: 'leaderboard', description: 'Top referrers' },
         ]).catch(() => {});
         bot.launch({ allowedUpdates: ['message', 'callback_query', 'chat_member', 'my_chat_member'] });
       })

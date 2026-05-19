@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node index.js"
+    "dev": "node --watch index.js",
+    "seed:keywords": "node seed.js"
   },
   "dependencies": {
     "dotenv": "^17.2.1",

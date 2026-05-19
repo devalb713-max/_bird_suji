@@ -5,13 +5,12 @@ This project is a Telegram platform for developers where:
 - Group-finder Telegram accounts discover developer groups using `en_SearchBot` + keywords and store group links in MongoDB.
 - Listener Telegram accounts join discovered groups and listen for job/hiring messages.
 - Preacher Telegram accounts join discovered groups and post admin-provided templates (optionally with a logo), continuously.
-- The bot enforces community access: 3-day trial, then 100 Stars monthly.
+- The bot enforces community access: 3-day trial, then 30-day subscription via **100 Sujicards** or **100 Stars**.
 
 ### Roles
 
 - **Inviter** (`role=inviter`)
-  - Logged-in Telegram account used to generate single-use invite links for the required channel/group.
-  - The bot revokes the invite link after the user joins.
+  - Logged-in Telegram account used to generate invite links for the required channel/group and admin ops fallback (when the bot lacks rights).
 - **Group Finder** (`role=finder`)
   - Searches for groups using keywords from the bot’s Keywords menu.
   - Stores discovered `t.me` links in `GroupLink` records.
@@ -19,7 +18,8 @@ This project is a Telegram platform for developers where:
 - **Listener** (`role=listener`)
   - Joins groups from the stored `GroupLink` pool until ~500 groups per account.
   - Listens to messages in groups and classifies “job/hiring intent”.
-  - If a message qualifies, formats it and posts it to the configured Jobs Target chat (or queues it if posting is disabled).
+  - If a message qualifies, formats it and posts it to the configured Jobs Target chat (or a fallback set of approved groups).
+  - Enforces “no two listeners in the same group” and dedupes posts defensively.
 - **Preacher** (`role=preacher`)
   - Joins groups from the stored `GroupLink` pool until ~500 groups per account.
   - Posts message templates in an endless cycle.
@@ -36,6 +36,8 @@ Environment variables (see `.env.example`):
 - `BOT_ADMIN_ID` (bootstrap first admin user id)
 - `API_ID`, `API_HASH` (required for Telegram account login via the admin panel)
 - `SEARCH_BOT_USERNAME` (default `en_SearchBot`)
+- Listener + AI pipeline
+  - `AI_BATCH_INTERVAL_MS` (how often the job-classification/posting batch runs)
 - AI classification (optional)
   - `OPENAI_API_KEY`, `OPENAI_MODEL` (default `gpt-4o-mini`)
   - `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` (default `meta-llama/llama-3.1-8b-instruct:free`)
@@ -49,11 +51,13 @@ npm install
 npm start
 ```
 
+The bot uses **long polling** for updates. Listener/Preacher/Finder roles use **MTProto user sessions** (GramJS).
+
 ### Bot admin panel
 
 - **Accounts**
   - Add Telegram accounts and choose a role (Listener / Preacher / Group Finder / Inviter) before login.
-  - Start/stop Join/Search and Listen/Preach loops per account.
+  - Start/stop Join/Search and Listen/Preach loops per account (workers do not auto-start on boot).
 - **Templates**
   - Add/delete templates (admin-only). Preachers randomly pick from these.
 - **Keywords**
@@ -69,7 +73,15 @@ npm start
 ### Community access enforcement
 
 - Users must `/start` the bot to create a DB record and begin the 3-day trial.
-- When trial expires, users are removed from the required group/channel (kick, not ban).
-- Paid membership is 100 Stars monthly, with reminders (3 days before expiry and during trial at 8h/2h).
-- Payments are recorded as pending until the user joins the required chats; joining activates/extends the subscription.
-- Anyone joining required chats without an active trial/subscription record is removed (admins are exempt).
+- Trial/subscription expiry triggers removal from the required group/channel (kick-style). If Telegram requires a ban, unban is attempted immediately or scheduled shortly after.
+- Paid membership is **100 Sujicards** or **100 Stars** per 30 days, with reminders during trial (8h/2h) and before subscription expiry (3 days).
+- Payments are activated only after the user is in the required chats. Payment confirm flows are guarded against double-taps.
+- New users get a short onboarding grace window after join links are issued, to avoid being removed mid-join.
+
+### Scripts
+
+```bash
+node seed.js
+node seed-templates.js
+node rename-accounts.js
+```

@@ -1,4 +1,5 @@
 import { TelegramClient } from 'telegram';
+import { Logger } from 'telegram/extensions/Logger.js';
 import { StringSession } from 'telegram/sessions/index.js';
 import { Api } from 'telegram/tl/index.js';
 import { CustomFile } from 'telegram/client/uploads.js';
@@ -8,6 +9,7 @@ import { randomFingerprint, getAccountFingerprint } from './fingerprint.js';
 // Omit (or null) for ephemeral clients (auth flow, one-shot fetches).
 export function createClient(sessionString = '', accountId = null) {
   const fp = accountId ? getAccountFingerprint(accountId) : randomFingerprint();
+  const baseLogger = new Logger('none');
   const client = new TelegramClient(
     new StringSession(sessionString),
     parseInt(process.env.API_ID),
@@ -15,6 +17,7 @@ export function createClient(sessionString = '', accountId = null) {
     {
       connectionRetries: 5,
       requestRetries: 3,
+      baseLogger,
       deviceModel: fp.deviceModel,
       systemVersion: fp.systemVersion,
       appVersion: fp.appVersion,
