@@ -128,6 +128,13 @@ function isMessageNotModifiedError(err) {
   return d.includes('message is not modified');
 }
 
+function isCantParseEntitiesError(err) {
+  const { code, desc } = describeTelegramError(err);
+  if (Number(code) !== 400) return false;
+  const d = (desc || '').toString().toLowerCase();
+  return d.includes("can't parse entities");
+}
+
 function isServiceSpamMessage(msg) {
   if (!msg) return false;
   return !!(
@@ -682,10 +689,10 @@ export async function handleStart(ctx) {
 
   const text = '👋 *Welcome to Sujini*\n\nUse the buttons below to manage accounts, groups, broadcasts, and settings:';
   if (ctx.callbackQuery) {
-    await ctx.editMessageText(text, { parse_mode: 'Markdown', ...mainMenu() });
+    await safeEditMessageText(ctx, text, { parse_mode: 'Markdown', ...mainMenu() });
     await ctx.answerCbQuery();
   } else {
-    await ctx.reply(text, { parse_mode: 'Markdown', ...mainMenu() });
+    await safeReply(ctx, text, { parse_mode: 'Markdown', ...mainMenu() });
   }
 }
 
@@ -1627,16 +1634,52 @@ function escHtml(s) {
     .replaceAll('>', '&gt;');
 }
 
+function withoutParseMode(extra) {
+  if (!extra) return {};
+  const payload = { ...extra };
+  delete payload.parse_mode;
+  return payload;
+}
+
+async function safeEditMessageText(ctx, text, extra = null) {
+  const payload = extra || {};
+  try {
+    await ctx.editMessageText(text, payload);
+    return true;
+  } catch (err) {
+    if (isMessageNotModifiedError(err)) return true;
+    if (isCantParseEntitiesError(err) && payload?.parse_mode) {
+      await ctx.editMessageText(text, withoutParseMode(payload)).catch(() => {});
+      return true;
+    }
+    return false;
+  }
+}
+
+async function safeReply(ctx, text, extra = null) {
+  const payload = extra || {};
+  try {
+    await ctx.reply(text, payload);
+    return true;
+  } catch (err) {
+    if (isCantParseEntitiesError(err) && payload?.parse_mode) {
+      await ctx.reply(text, withoutParseMode(payload)).catch(() => {});
+      return true;
+    }
+    return false;
+  }
+}
+
 async function replyOrEdit(ctx, text, extra = null) {
   const payload = extra || {};
   if (ctx.callbackQuery) {
     await ctx.answerCbQuery().catch(() => {});
     if (typeof ctx.editMessageText === 'function') {
-      const ok = await ctx.editMessageText(text, payload).then(() => true).catch(() => false);
+      const ok = await safeEditMessageText(ctx, text, payload);
       if (ok) return true;
     }
   }
-  await ctx.reply(text, payload).catch(() => {});
+  await safeReply(ctx, text, payload);
   return true;
 }
 
@@ -1890,7 +1933,7 @@ export async function handleAdminsMenu(ctx) {
     text += `${i + 1}. ${a.username || ''} ${a.userId ? `(${a.userId})` : ''}\n`;
   });
 
-  await ctx.editMessageText(text, {
+  await safeEditMessageText(ctx, text, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [Markup.button.callback('➕ Add Admin', 'add_admin')],
@@ -1903,7 +1946,7 @@ export async function handleAdminsMenu(ctx) {
 
 export async function handleAddAdmin(ctx) {
   setSession(ctx.from.id, { step: 'awaiting_admin_id', data: {} });
-  await ctx.editMessageText(
+  await safeEditMessageText(
     '👑 *Add Admin*\n\nSend their Telegram user ID or @username:',
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'admins_menu')]]) }
   );
@@ -1954,7 +1997,7 @@ export async function handleDeleteAdmin(ctx, adminId) {
 export async function handleAccounts(ctx) {
   const accounts = await Account.find({}).sort({ createdAt: 1 });
   if (!accounts.length) {
-    await ctx.editMessageText('No accounts yet. Add an account from the main menu to begin.', backToMain());
+    await safeEditMessageText(ctx, 'No accounts yet. Add an account from the main menu to begin.', backToMain());
     return ctx.answerCbQuery();
   }
   const buttons = accounts.map((acc, i) => {
@@ -1962,7 +2005,7 @@ export async function handleAccounts(ctx) {
     return [Markup.button.callback(label, `acc_${acc._id}`)];
   });
   buttons.push([Markup.button.callback('« Back', 'back_to_main')]);
-  await ctx.editMessageText('📋 *Accounts*\n\nSelect an account below to manage it:', { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await safeEditMessageText(ctx, '📋 *Accounts*\n\nSelect an account below to manage it:', { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
   await ctx.answerCbQuery();
 }
 
@@ -2003,7 +2046,7 @@ export async function handleAccountDetail(ctx, accId) {
     ? Markup.button.callback('🔴 Stop Listen/Preach', `stop_msg_${acc._id}`)
     : Markup.button.callback('🟢 Start Listen/Preach', `start_msg_${acc._id}`);
 
-  await ctx.editMessageText(text, {
+  await safeEditMessageText(ctx, text, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [joinBtn],
@@ -2032,7 +2075,7 @@ export async function handleAddAccount(ctx) {
   const cPreacher = map.preacher || 0;
   const cFinder = map.finder || 0;
   const cInviter = map.inviter || 0;
-  await ctx.editMessageText(
+  await safeEditMessageText(
     '📱 *Add Account*\n\nSelect the account type:',
     {
       parse_mode: 'Markdown',
@@ -2076,16 +2119,16 @@ export async function handlePhoneNumber(ctx, session) {
   if (existing?.session) {
     clearSession(ctx.from.id);
     return ctx.reply(
-      `⚠️ This Telegram account is already logged in as *${existing.role}* (${existing.username ? '@' + existing.username : existing.number}).\n\n` +
+      `⚠️ This Telegram account is already logged in as ${existing.role} (${existing.username ? '@' + existing.username : existing.number}).\n\n` +
         `It cannot be logged in again under another role. Remove it first if you really need to change its role.`,
-      { parse_mode: 'Markdown', ...mainMenu() }
+      { ...mainMenu() }
     );
   }
   if (existing) {
     clearSession(ctx.from.id);
     return ctx.reply(
-      `⚠️ This Telegram account is already added (${existing.role}).\n\nUse *Accounts* to manage it.`,
-      { parse_mode: 'Markdown', ...mainMenu() }
+      `⚠️ This Telegram account is already added (${existing.role}).\n\nUse Accounts to manage it.`,
+      { ...mainMenu() }
     );
   }
 
@@ -2213,15 +2256,15 @@ async function _saveNewAccount(ctx, phoneNumber, client) {
   const existing = await Account.findOne({ number: phoneNumber });
   if (existing?.session) {
     return ctx.reply(
-      `⚠️ This Telegram account is already logged in as *${existing.role}* (${existing.username ? '@' + existing.username : existing.number}).\n\n` +
+      `⚠️ This Telegram account is already logged in as ${existing.role} (${existing.username ? '@' + existing.username : existing.number}).\n\n` +
         `It cannot be logged in again under another role. Remove it first if you really need to change its role.`,
-      { parse_mode: 'Markdown', ...mainMenu() }
+      { ...mainMenu() }
     );
   }
   if (existing) {
     return ctx.reply(
-      `⚠️ This Telegram account is already added (${existing.role}).\n\nUse *Accounts* to manage it.`,
-      { parse_mode: 'Markdown', ...mainMenu() }
+      `⚠️ This Telegram account is already added (${existing.role}).\n\nUse Accounts to manage it.`,
+      { ...mainMenu() }
     );
   }
   const shouldAutoStartJoin = role === 'finder';
@@ -2252,7 +2295,7 @@ async function _saveNewAccount(ctx, phoneNumber, client) {
 
 export async function handleTemplatesMenu(ctx) {
   const count = await MessageTemplate.countDocuments();
-  await ctx.editMessageText(
+  await safeEditMessageText(
     `🧾 *Templates* (${count})`,
     {
       parse_mode: 'Markdown',
@@ -2306,7 +2349,7 @@ const KW_PAGE = 10;
 
 export async function handleKeywordsMenu(ctx) {
   const count = await Keyword.countDocuments();
-  await ctx.editMessageText(
+  await safeEditMessageText(
     `🔑 *Keywords* (${count} total)`,
     {
       parse_mode: 'Markdown',
@@ -2322,7 +2365,7 @@ export async function handleKeywordsMenu(ctx) {
 
 export async function handleAddKeywords(ctx) {
   setSession(ctx.from.id, { step: 'awaiting_keywords', data: {} });
-  await ctx.editMessageText(
+  await safeEditMessageText(
     '➕ *Add Keywords*\n\nSend keywords separated by commas, or spaces if no commas:\nExample: `react, node, python`',
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'keywords_menu')]]) }
   );
@@ -2346,7 +2389,7 @@ export async function handleKeywordsInput(ctx) {
 export async function handleViewKeywords(ctx, page = 0) {
   const total = await Keyword.countDocuments();
   if (!total) {
-    await ctx.editMessageText('No keywords yet. Add a few, then come back here to manage them.', Markup.inlineKeyboard([[Markup.button.callback('« Back', 'keywords_menu')]]));
+    await safeEditMessageText(ctx, 'No keywords yet. Add a few, then come back here to manage them.', Markup.inlineKeyboard([[Markup.button.callback('« Back', 'keywords_menu')]]));
     return ctx.answerCbQuery();
   }
   const keywords = await Keyword.find({}).sort({ createdAt: 1 }).skip(page * KW_PAGE).limit(KW_PAGE);
@@ -2357,7 +2400,7 @@ export async function handleViewKeywords(ctx, page = 0) {
   if (page < totalPages - 1) buttons.push([Markup.button.callback('Next ➡️', `view_keywords_${page + 1}`)]);
   buttons.push([Markup.button.callback('« Back', 'keywords_menu')]);
 
-  await ctx.editMessageText(
+  await safeEditMessageText(
     `🔑 *Keywords* (page ${page + 1}/${totalPages}, total ${total})\n_Click a keyword to delete it_`,
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
   );
@@ -2403,7 +2446,7 @@ export async function handleAuthGroupsMenu(ctx, page = 0) {
     `Admins can also /approve or /disapprove inside a group.\n\n` +
     `Known groups: *${total}* (page ${safePage + 1}/${totalPages})`;
 
-  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await safeEditMessageText(ctx, text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
   await ctx.answerCbQuery();
 }
 
@@ -2453,7 +2496,7 @@ export async function handleAuthChannelsMenu(ctx, page = 0) {
     `Approved channels are mandatory for user access.\n\n` +
     `Known channels: *${total}* (page ${safePage + 1}/${totalPages})`;
 
-  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await safeEditMessageText(ctx, text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
   await ctx.answerCbQuery();
 }
 
@@ -2480,7 +2523,7 @@ export async function handleBroadcastMenu(ctx) {
     `Send one message (text/photo/video/document/etc) and it will be copied to selected bot users (in DB) in batches.\n` +
     `Rate limit is capped at 28 messages/sec.`;
 
-  await ctx.editMessageText(text, {
+  await safeEditMessageText(ctx, text, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [Markup.button.callback('▶️ All users', 'broadcast_start')],
@@ -2657,7 +2700,7 @@ export async function handleSettingsMenu(ctx) {
     `AI alerts: ${s.aiAlertsEnabled ? '✅ ON' : '⛔ OFF'}\n` +
     `Auto-resume workers: ${s.autoResumeWorkers ? '✅ ON' : '⛔ OFF'}`;
 
-  await ctx.editMessageText(text, {
+  await safeEditMessageText(ctx, text, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [Markup.button.callback('Set Inviter Accounts', 'set_inviter_account')],
@@ -2805,7 +2848,7 @@ export async function handleGroupLinksMenu(ctx) {
     `Joined: *${counts.joined || 0}*\n` +
     `Dead: *${counts.dead || 0}*`;
 
-  await ctx.editMessageText(text, {
+  await safeEditMessageText(ctx, text, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [Markup.button.callback('♻️ Reset Claimed → New', 'grouplinks_reset_claimed')],
@@ -2931,13 +2974,14 @@ export async function handleSubscribeWithSujicards(ctx) {
     `Balance: *${balance}*`;
 
   if (ctx.callbackQuery?.message) {
-    await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(sujicardConfirmKeyboard(nonce, cost).reply_markup.inline_keyboard) })
-      .catch(() => ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(sujicardConfirmKeyboard(nonce, cost).reply_markup.inline_keyboard) }).catch(() => {}));
+    const extra = { parse_mode: 'Markdown', ...Markup.inlineKeyboard(sujicardConfirmKeyboard(nonce, cost).reply_markup.inline_keyboard) };
+    const ok = await safeEditMessageText(ctx, text, extra);
+    if (!ok) await safeReply(ctx, text, extra);
     await ctx.answerCbQuery('Confirm?', { show_alert: false }).catch(() => {});
     return;
   }
 
-  await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(sujicardConfirmKeyboard(nonce, cost).reply_markup.inline_keyboard) }).catch(() => {});
+  await safeReply(ctx, text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(sujicardConfirmKeyboard(nonce, cost).reply_markup.inline_keyboard) });
 }
 
 async function handleSubscribeWithSujicardsConfirm(ctx) {
@@ -3504,7 +3548,7 @@ export function setupHandlers(bot) {
   ensureApprovedChatCacheLoaded().catch(() => {});
 
   bot.catch((err, ctx) => {
-    if (isStaleCallbackQueryError(err) || isMessageNotModifiedError(err)) return;
+    if (isStaleCallbackQueryError(err) || isMessageNotModifiedError(err) || isCantParseEntitiesError(err)) return;
     try {
       if (ctx?.callbackQuery) {
         ctx.answerCbQuery('❌ Something went wrong').catch(() => {});
