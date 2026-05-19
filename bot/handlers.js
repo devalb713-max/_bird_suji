@@ -368,11 +368,28 @@ function createRateLimitedQueue(perSecond = 28) {
 const outboundQueue = createRateLimitedQueue(28);
 
 const userSessions = new Map();
-let authClient = null;
+const authClients = new Map();
 
 function getSession(userId) { return userSessions.get(userId.toString()); }
 function setSession(userId, data) { userSessions.set(userId.toString(), data); }
 function clearSession(userId) { userSessions.delete(userId.toString()); }
+
+function getAuthClient(adminId) { return authClients.get(adminId.toString()) || null; }
+function setAuthClient(adminId, client) { authClients.set(adminId.toString(), client); }
+function clearAuthClient(adminId) { authClients.delete(adminId.toString()); }
+
+async function withTimeout(promise, ms, label = 'timeout') {
+  let t = null;
+  const timeout = new Promise((_, reject) => {
+    t = setTimeout(() => reject(new Error(label)), ms);
+    if (t?.unref) t.unref();
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (t) clearTimeout(t);
+  }
+}
 
 const MEMBERSHIP_SWEEP_LEASE_ID = `membership_sweep:${process.pid}:${randomBytes(6).toString('hex')}`;
 const MEMBERSHIP_SWEEP_LEASE_MS = 2 * 60 * 1000;
@@ -2046,6 +2063,14 @@ export async function handlePickAccountRole(ctx, role) {
 export async function handlePhoneNumber(ctx, session) {
   if (!(await requireAdmin(ctx))) return clearSession(ctx.from.id);
   const phone = ctx.message.text.trim();
+  const adminId = ctx.from?.id?.toString?.() || '';
+  if (adminId && getAuthClient(adminId)) {
+    await ctx.reply(
+      '⏳ Still sending verification code… please wait.',
+      { ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'back_to_main')]]) }
+    ).catch(() => {});
+    return;
+  }
 
   const existing = await Account.findOne({ number: phone });
   if (existing?.session) {
@@ -2067,19 +2092,24 @@ export async function handlePhoneNumber(ctx, session) {
   await ctx.reply('⏳ Sending verification code...');
 
   const fp = randomFingerprint();
-  authClient = new TelegramClient(new StringSession(''), parseInt(process.env.API_ID), process.env.API_HASH, {
+  let client = new TelegramClient(new StringSession(''), parseInt(process.env.API_ID), process.env.API_HASH, {
     useWSS: false, autoReconnect: true, timeout: 30000,
     requestRetries: 3, connectionRetries: 5,
     deviceModel: fp.deviceModel, systemVersion: fp.systemVersion,
     appVersion: fp.appVersion, langCode: fp.langCode, systemLangCode: fp.systemLangCode,
   });
+  if (adminId) setAuthClient(adminId, client);
 
   try {
-    await authClient.connect();
-    const result = await sendCodeWithRetry(authClient, phone);
+    await withTimeout(client.connect(), 45_000, 'login_connect_timeout');
+    const result = await withTimeout(sendCodeWithRetry(client, phone), 45_000, 'login_send_code_timeout');
     if (!result.success) throw new Error(result.error);
 
-    authClient = result.client || authClient;
+    if (result.client && result.client !== client) {
+      try { await client.disconnect(); } catch {}
+      client = result.client;
+      if (adminId) setAuthClient(adminId, client);
+    }
     session.data = { ...session.data, phoneNumber: phone, phoneCodeHash: result.phoneCodeHash };
     session.step = 'awaiting_code';
     setSession(ctx.from.id, session);
@@ -2087,8 +2117,8 @@ export async function handlePhoneNumber(ctx, session) {
     await ctx.reply('🔐 Code sent! Enter the verification code:', Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'back_to_main')]]));
   } catch (err) {
     clearSession(ctx.from.id);
-    try { await authClient?.disconnect(); } catch {}
-    authClient = null;
+    if (adminId) clearAuthClient(adminId);
+    try { await client?.disconnect(); } catch {}
     await ctx.reply(`❌ Failed: ${err.message}`, mainMenu());
   }
 }
@@ -2097,18 +2127,20 @@ export async function handleVerificationCode(ctx, session) {
   if (!(await requireAdmin(ctx))) return clearSession(ctx.from.id);
   const code = ctx.message.text.trim();
   const { phoneNumber, phoneCodeHash } = session.data;
-  if (!authClient) { clearSession(ctx.from.id); return ctx.reply('Session expired. Start again.', mainMenu()); }
+  const adminId = ctx.from?.id?.toString?.() || '';
+  const client = adminId ? getAuthClient(adminId) : null;
+  if (!client) { clearSession(ctx.from.id); return ctx.reply('Session expired. Start again.', mainMenu()); }
 
   await ctx.reply('⏳ Logging in...');
-  if (!authClient.connected) await authClient.connect();
+  if (!client.connected) await withTimeout(client.connect(), 45_000, 'login_connect_timeout');
 
   try {
-    await authClient.invoke(new Api.auth.SignIn({
+    await client.invoke(new Api.auth.SignIn({
       phoneNumber,
       phoneCodeHash,
       phoneCode: code,
     }));
-    await _saveNewAccount(ctx, phoneNumber);
+    await _saveNewAccount(ctx, phoneNumber, client).catch(() => {});
   } catch (err) {
     if (err.code === 401 && err.errorMessage === 'SESSION_PASSWORD_NEEDED') {
       session.step = 'awaiting_password';
@@ -2116,8 +2148,8 @@ export async function handleVerificationCode(ctx, session) {
       return ctx.reply('🔒 2FA enabled. Send your password:', Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'back_to_main')]]));
     }
     clearSession(ctx.from.id);
-    try { await authClient?.disconnect(); } catch {}
-    authClient = null;
+    if (adminId) clearAuthClient(adminId);
+    try { await client?.disconnect(); } catch {}
     return ctx.reply(`❌ Login failed: ${err.message}`, mainMenu());
   }
 }
@@ -2126,34 +2158,36 @@ export async function handlePassword(ctx, session) {
   if (!(await requireAdmin(ctx))) return clearSession(ctx.from.id);
   const password = ctx.message.text.trim();
   const { phoneNumber } = session.data;
-  if (!authClient) { clearSession(ctx.from.id); return ctx.reply('Session expired. Start again.', mainMenu()); }
+  const adminId = ctx.from?.id?.toString?.() || '';
+  const client = adminId ? getAuthClient(adminId) : null;
+  if (!client) { clearSession(ctx.from.id); return ctx.reply('Session expired. Start again.', mainMenu()); }
 
   await ctx.reply('⏳ Verifying password...');
-  if (!authClient.connected) await authClient.connect();
+  if (!client.connected) await withTimeout(client.connect(), 45_000, 'login_connect_timeout');
 
   try {
-    const passwordInfo = await authClient.invoke(new Api.account.GetPassword());
+    const passwordInfo = await client.invoke(new Api.account.GetPassword());
     const { computeCheck } = await import('telegram/Password.js');
     const passwordHash = await computeCheck(passwordInfo, password);
-    await authClient.invoke(new Api.auth.CheckPassword({ password: passwordHash }));
-    await _saveNewAccount(ctx, phoneNumber);
+    await client.invoke(new Api.auth.CheckPassword({ password: passwordHash }));
+    await _saveNewAccount(ctx, phoneNumber, client).catch(() => {});
   } catch (err) {
     if (err.errorMessage === 'PASSWORD_HASH_INVALID') {
       return ctx.reply('❌ Wrong password. Try again:', Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'back_to_main')]]));
     }
     clearSession(ctx.from.id);
-    try { await authClient?.disconnect(); } catch {}
-    authClient = null;
+    if (adminId) clearAuthClient(adminId);
+    try { await client?.disconnect(); } catch {}
     return ctx.reply(`❌ Login failed: ${err.message}`, mainMenu());
   }
 }
 
-async function _saveNewAccount(ctx, phoneNumber) {
+async function _saveNewAccount(ctx, phoneNumber, client) {
   const session = getSession(ctx.from.id);
   const role = session?.data?.role || 'listener';
   clearSession(ctx.from.id);
 
-  const me = await authClient.getMe();
+  const me = await client.getMe();
   const roleLabel = role === 'finder' ? 'groupfinder' : role;
   const rawId = me.id?.toString?.() || phoneNumber.replace(/\D/g, '');
   const idPrefix = rawId.toString().replace(/\D/g, '').slice(0, 5) || rawId.toString().slice(0, 5);
@@ -2164,16 +2198,17 @@ async function _saveNewAccount(ctx, phoneNumber) {
     .replace(/^_+/, '')
     .slice(0, 32);
 
-  await authClient
+  await client
     .invoke(new Api.account.UpdateProfile({ firstName: desiredBase, lastName: '' }))
     .catch(() => {});
   if (desiredUsername && desiredUsername.length >= 5) {
-    await authClient.invoke(new Api.account.UpdateUsername({ username: desiredUsername })).catch(() => {});
+    await client.invoke(new Api.account.UpdateUsername({ username: desiredUsername })).catch(() => {});
   }
 
-  const sessionString = authClient.session.save();
-  await authClient.disconnect();
-  authClient = null;
+  const sessionString = client.session.save();
+  try { await client.disconnect(); } catch {}
+  const adminId = ctx.from?.id?.toString?.() || '';
+  if (adminId) clearAuthClient(adminId);
 
   const existing = await Account.findOne({ number: phoneNumber });
   if (existing?.session) {
@@ -2189,21 +2224,30 @@ async function _saveNewAccount(ctx, phoneNumber) {
       { parse_mode: 'Markdown', ...mainMenu() }
     );
   }
-  await Account.create({
+  const shouldAutoStartJoin = role === 'finder';
+  const created = await Account.create({
     number: phoneNumber,
     username: desiredUsername || me.username || null,
     userId: me.id?.toString() || null,
     session: sessionString,
     role,
     groups: [],
-    isJoining: false,
+    isJoining: shouldAutoStartJoin,
     isMessaging: false,
   });
 
-  await ctx.reply(
-    `✅ *Account added!*\nType: *${role}*\nUsername: ${desiredUsername ? '@' + desiredUsername : me.username ? '@' + me.username : 'N/A'}\nPhone: ${phoneNumber}`,
-    { parse_mode: 'Markdown', ...mainMenu() }
-  );
+  const shownUsername = desiredUsername || me.username || null;
+  const lines = [
+    '✅ Account added!',
+    `Type: ${role}`,
+    `Username: ${shownUsername ? '@' + shownUsername : 'N/A'}`,
+    `Phone: ${phoneNumber}`,
+    shouldAutoStartJoin ? 'Auto-start: group finder running' : null,
+  ].filter(Boolean);
+  await ctx.reply(lines.join('\n'), { ...mainMenu() }).catch(() => {});
+  if (shouldAutoStartJoin) {
+    await startJoinWorker(created._id.toString()).catch(() => {});
+  }
 }
 
 export async function handleTemplatesMenu(ctx) {
@@ -2610,12 +2654,14 @@ export async function handleSettingsMenu(ctx) {
     `Mandatory groups (approved): ${groups.length}\n` +
     `Inviter accounts selected: ${inviterIds.length}\n\n` +
     `Bot posting: ${s.botPostingEnabled ? '✅ ON' : '⛔ OFF'}\n` +
-    `AI alerts: ${s.aiAlertsEnabled ? '✅ ON' : '⛔ OFF'}`;
+    `AI alerts: ${s.aiAlertsEnabled ? '✅ ON' : '⛔ OFF'}\n` +
+    `Auto-resume workers: ${s.autoResumeWorkers ? '✅ ON' : '⛔ OFF'}`;
 
   await ctx.editMessageText(text, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [Markup.button.callback('Set Inviter Accounts', 'set_inviter_account')],
+      [Markup.button.callback(s.autoResumeWorkers ? 'Disable Auto-Resume' : 'Enable Auto-Resume', 'toggle_auto_resume')],
       [Markup.button.callback(s.botPostingEnabled ? 'Disable Posting' : 'Enable Posting', 'toggle_posting')],
       [Markup.button.callback(s.aiAlertsEnabled ? 'Disable AI Alerts' : 'Enable AI Alerts', 'toggle_ai_alerts')],
       [Markup.button.callback('Flush Queue', 'flush_queue')],
@@ -2701,6 +2747,15 @@ export async function handleToggleAiAlerts(ctx) {
   s.aiAlertsEnabled = !s.aiAlertsEnabled;
   await s.save();
   await ctx.answerCbQuery(s.aiAlertsEnabled ? '✅ AI alerts enabled' : '⛔ AI alerts disabled');
+  return handleSettingsMenu(ctx);
+}
+
+export async function handleToggleAutoResume(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const s = await getSettings();
+  s.autoResumeWorkers = !s.autoResumeWorkers;
+  await s.save();
+  await ctx.answerCbQuery(s.autoResumeWorkers ? '✅ Auto-resume enabled' : '⛔ Auto-resume disabled');
   return handleSettingsMenu(ctx);
 }
 
@@ -3601,6 +3656,7 @@ export function setupHandlers(bot) {
   bot.action('settings_menu', handleSettingsMenu);
   bot.action('toggle_posting', handleTogglePosting);
   bot.action('toggle_ai_alerts', handleToggleAiAlerts);
+  bot.action('toggle_auto_resume', handleToggleAutoResume);
   bot.action('flush_queue', handleFlushQueue);
   bot.action('set_inviter_account', handleSetInviterAccount);
   bot.action(/^pick_inviter_(.+)$/, ctx => handlePickInviterAccount(ctx, ctx.match[1]));

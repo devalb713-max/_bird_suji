@@ -15,6 +15,8 @@ import {
 } from "./models/db.js";
 import { setupHandlers, seedOnStartup, startSchedulers } from "./bot/handlers.js";
 import launchBot from "./bot/launchBot.js";
+import { startJoinWorker } from "./workers/joinWorker.js";
+import { startMessageWorker } from "./workers/messageWorker.js";
 import express from "express";
 
 const app = express();
@@ -505,7 +507,20 @@ async function connectWithRetry() {
 
 await connectWithRetry();
 
+async function resumeWorkersOnBoot() {
+  const settings = (await BotSettings.findOne({})) || (await BotSettings.create({}));
+  if (!settings?.autoResumeWorkers) return;
+
+  const accounts = await Account.find({ session: { $nin: [null, ""] } }, "_id role isJoining isMessaging").lean();
+  for (const acc of accounts) {
+    if (acc.role === "inviter") continue;
+    if (acc.isJoining) await startJoinWorker(acc._id.toString()).catch(() => {});
+    if (acc.isMessaging) await startMessageWorker(acc._id.toString()).catch(() => {});
+  }
+}
+
 await seedOnStartup();
 setupHandlers(bot);
 launchBot(bot);
 startSchedulers(bot.telegram);
+await resumeWorkersOnBoot();

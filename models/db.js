@@ -93,6 +93,7 @@ const botSettingsSchema = new mongoose.Schema(
     aiCreditsAlertedAt: { type: Date, default: null },
     listenerGroupsAnnouncedCount: { type: Number, default: 0 },
     listenerGroupsAnnouncedAt: { type: Date, default: null },
+    autoResumeWorkers: { type: Boolean, default: true },
     membershipSweepLeaseId: { type: String, default: null },
     membershipSweepLeaseExpiresAt: { type: Date, default: null },
     membershipSweepLeaseUpdatedAt: { type: Date, default: null },
