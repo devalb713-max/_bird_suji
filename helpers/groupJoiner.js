@@ -4,7 +4,7 @@ import { createClient, sendWithTyping, extractUsernameFromLink, extractInviteHas
 import { addGroup } from './groupRegistry.js';
 
 const SEARCH_BOT = process.env.SEARCH_BOT_USERNAME || 'en_SearchBot';
-const DAILY_LIMIT_PATTERN = /you have reached your daily usage limit/i;
+const DAILY_LIMIT_PATTERN = /(you have reached your daily usage limit|daily usage limit exceeded|bot unresponsive|unlock or try (again )?tomorrow)/i;
 const NO_RESULTS_PATTERN = /sorry,?\s*no link found/i;
 
 function isSearchLimitMessage(text = '') {
