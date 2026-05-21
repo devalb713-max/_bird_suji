@@ -291,6 +291,16 @@ export const PostDedupe = mongoose.model('PostDedupe', postDedupeSchema);
 
 export async function connectDB() {
   mongoose.set('runValidators', true);
-  await mongoose.connect(process.env.MONGODB_URI, { dbName: 'sujini' });
+  const serverSelectionTimeoutMS = Math.max(10_000, Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 120_000));
+  const connectTimeoutMS = Math.max(10_000, Number(process.env.MONGO_CONNECT_TIMEOUT_MS || 120_000));
+  const socketTimeoutMS = Math.max(10_000, Number(process.env.MONGO_SOCKET_TIMEOUT_MS || 120_000));
+  const heartbeatFrequencyMS = Math.max(5_000, Number(process.env.MONGO_HEARTBEAT_FREQUENCY_MS || 10_000));
+  await mongoose.connect(process.env.MONGODB_URI, {
+    dbName: 'sujini',
+    serverSelectionTimeoutMS,
+    connectTimeoutMS,
+    socketTimeoutMS,
+    heartbeatFrequencyMS,
+  });
   console.log('✅ Connected to MongoDB');
 }

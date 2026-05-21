@@ -250,11 +250,28 @@ async function maybeSendReviewDumpCandidate(doc) {
     const extraRows = Array.isArray(post?.reply_markup?.inline_keyboard) ? post.reply_markup.inline_keyboard : [];
     const reply_markup = { inline_keyboard: [approveRow, ...extraRows] };
 
-    const sent = await botTelegram.sendMessage(dumpChatId, `${header}${post.text}`, {
-      disable_web_page_preview: true,
-      parse_mode: 'HTML',
-      reply_markup,
-    }).catch(() => null);
+    const sendOnce = async (toChatId) => {
+      return botTelegram.sendMessage(toChatId, `${header}${post.text}`, {
+        disable_web_page_preview: true,
+        parse_mode: 'HTML',
+        reply_markup,
+      });
+    };
+
+    let sent = null;
+    let usedDumpChatId = dumpChatId;
+    try {
+      sent = await sendOnce(dumpChatId);
+    } catch (err) {
+      const migrateTo = err?.parameters?.migrate_to_chat_id;
+      if (migrateTo) {
+        usedDumpChatId = migrateTo.toString();
+        sent = await sendOnce(usedDumpChatId).catch(() => null);
+        await BotSettings.updateOne({}, { $set: { reviewDumpChatId: usedDumpChatId } }, { upsert: true }).catch(() => {});
+      } else {
+        throw err;
+      }
+    }
 
     if (sent?.message_id) {
       await AiQueueMessage.updateOne(
@@ -264,7 +281,7 @@ async function maybeSendReviewDumpCandidate(doc) {
             reviewScore: score,
             reviewMatched: matched,
             reviewSentAt: new Date(),
-            reviewDumpChatId: dumpChatId,
+            reviewDumpChatId: usedDumpChatId,
             reviewDumpMessageId: sent.message_id,
           },
         }
