@@ -1828,7 +1828,7 @@ async function handleLeaderboardCommand(ctx) {
     { $match: { status: 'credited' } },
     { $group: { _id: '$referrerUserId', total: { $sum: 1 } } },
     { $sort: { total: -1 } },
-    { $limit: 15 },
+    { $limit: 20 },
   ]);
 
   if (!rows.length) {
@@ -1986,20 +1986,36 @@ async function handleUserStart(ctx) {
 }
 
 export async function handleAdminsMenu(ctx) {
-  const admins = await Admin.find({}).sort({ createdAt: 1 });
-  let text = `👑 *Admins* (${admins.length})\n\n`;
+  const PAGE_SIZE = 12;
+  const match = ctx?.match?.[1] ? Number(ctx.match[1]) : 0;
+  const page = Number.isFinite(match) && match >= 0 ? match : 0;
+
+  const total = await Admin.countDocuments();
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const safePage = Math.min(page, pages - 1);
+
+  const admins = await Admin.find({})
+    .sort({ createdAt: 1 })
+    .skip(safePage * PAGE_SIZE)
+    .limit(PAGE_SIZE);
+
+  let text = `👑 *Admins* (${total})\n\n`;
   admins.forEach((a, i) => {
-    text += `${i + 1}. ${a.username || ''} ${a.userId ? `(${a.userId})` : ''}\n`;
+    const idx = safePage * PAGE_SIZE + i + 1;
+    text += `${idx}. ${a.username || ''} ${a.userId ? `(${a.userId})` : ''}\n`;
   });
 
-  await safeEditMessageText(ctx, text, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([
-      [Markup.button.callback('➕ Add Admin', 'add_admin')],
-      [Markup.button.callback('🗑️ Remove Admin', 'remove_admin_list')],
-      [Markup.button.callback('« Back', 'back_to_main')],
-    ]),
-  });
+  const nav = [];
+  if (safePage > 0) nav.push(Markup.button.callback('‹ Prev', `admins_page_${safePage - 1}`));
+  if (safePage < pages - 1) nav.push(Markup.button.callback('Next ›', `admins_page_${safePage + 1}`));
+
+  const rows = [];
+  rows.push([Markup.button.callback('➕ Add Admin', 'add_admin')]);
+  rows.push([Markup.button.callback('🗑️ Remove Admin', 'remove_admin_list')]);
+  if (nav.length) rows.push(nav);
+  rows.push([Markup.button.callback('« Back', 'back_to_main')]);
+
+  await safeEditMessageText(ctx, text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) });
   await ctx.answerCbQuery();
 }
 
@@ -3716,6 +3732,7 @@ export function setupHandlers(bot) {
   });
 
   bot.action('admins_menu', handleAdminsMenu);
+  bot.action(/^admins_page_(\d+)$/, handleAdminsMenu);
   bot.action('add_admin', handleAddAdmin);
   bot.action('remove_admin_list', handleRemoveAdminList);
   bot.action(/^del_admin_(.+)$/, ctx => handleDeleteAdmin(ctx, ctx.match[1]));
