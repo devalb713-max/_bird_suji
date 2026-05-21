@@ -11,6 +11,7 @@ This project is a Telegram platform for developers where:
 
 - **Inviter** (`role=inviter`)
   - Logged-in Telegram account used to generate invite links for the required channel/group and admin ops fallback (when the bot lacks rights).
+  - Exempt from group uniqueness rules and group-sync (doesn’t participate in harvesting/listening/preaching).
 - **Group Finder** (`role=finder`)
   - Searches for groups using keywords from the bot’s Keywords menu.
   - Stores discovered `t.me` links in `GroupLink` records.
@@ -19,13 +20,21 @@ This project is a Telegram platform for developers where:
   - Joins groups from the stored `GroupLink` pool until ~500 groups per account.
   - Listens to messages in groups and classifies “job/hiring intent”.
   - If a message qualifies, formats it and posts it to the configured Jobs Target chat (or a fallback set of approved groups).
-  - Enforces “no two listeners in the same group” and dedupes posts defensively.
+  - Enforces “no two worker accounts in the same group” (no listener/preacher overlap), except bot-approved groups.
+  - Uses keepalive + dialogs warm-up to keep MTProto updates reliable at scale.
 - **Preacher** (`role=preacher`)
   - Joins groups from the stored `GroupLink` pool until ~500 groups per account.
   - Posts message templates in an endless cycle.
   - Skips a group if its own message exists within the last 30 messages.
   - Leaves groups where posting is forbidden (group-level restrictions).
-  - Enforces “no two preachers in the same group”.
+  - Enforces “no two worker accounts in the same group” (no listener/preacher overlap), except bot-approved groups.
+  - Never posts into bot-approved groups (those are treated as operational/whitelisted groups).
+
+### Group membership + uniqueness rules
+
+- **Approved (authorized) bot groups are exempt**: any number of accounts can join them, but preachers must not post there.
+- **Every other group is exclusive across listeners and preachers**: before joining a group link, the account checks MongoDB to see if any listener/preacher is already in it; if yes, it skips that link.
+- A periodic **account-group sync** refreshes `Account.groups` from Telegram dialogs so DB membership stays accurate even after manual leaves/joins.
 
 ### Setup
 
@@ -38,6 +47,14 @@ Environment variables (see `.env.example`):
 - `SEARCH_BOT_USERNAME` (default `en_SearchBot`)
 - Listener + AI pipeline
   - `AI_BATCH_INTERVAL_MS` (how often the job-classification/posting batch runs)
+- Group sync + dedupe
+  - `ACCOUNT_GROUPS_SYNC_INTERVAL_MS` (default 5m)
+  - `LISTENER_DEDUPE_INTERVAL_MS` (default 5m)
+  - `LISTENER_DEDUPE_MAX_LEAVES` (default 8)
+- Listener reliability (MTProto keepalive)
+  - `LISTENER_KEEPALIVE_MS` (default 60s)
+  - `LISTENER_DIALOGS_WARM_MS` (default 60s)
+  - `LISTENER_RECONNECT_IDLE_MS` (default 12m)
 - AI classification (optional)
   - `OPENAI_API_KEY`, `OPENAI_MODEL` (default `gpt-4o-mini`)
   - `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` (default `meta-llama/llama-3.1-8b-instruct:free`)
@@ -69,6 +86,7 @@ The bot uses **long polling** for updates. Listener/Preacher/Finder roles use **
   - Set Inviter Account (must be admin in required chats)
   - Toggle bot posting (queues while disabled, flushes on enable)
   - Toggle AI alerts (admin notifications after repeated AI failures)
+  - Joined-groups milestone announcements (posts when total unique groups increases by 40+)
 
 ### Community access enforcement
 
@@ -84,4 +102,5 @@ The bot uses **long polling** for updates. Listener/Preacher/Finder roles use **
 node seed.js
 node seed-templates.js
 node rename-accounts.js
+node dedupe-cross-role-groups.js
 ```

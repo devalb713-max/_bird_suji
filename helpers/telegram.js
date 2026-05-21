@@ -17,6 +17,9 @@ export function createClient(sessionString = '', accountId = null) {
     {
       connectionRetries: 5,
       requestRetries: 3,
+      autoReconnect: true,
+      retryDelay: 1000,
+      timeout: 30000,
       baseLogger,
       deviceModel: fp.deviceModel,
       systemVersion: fp.systemVersion,

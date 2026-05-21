@@ -431,8 +431,12 @@ function normalizeLinkKey(link) {
 
 async function getAnnouncementTargetChatIds() {
   const s = await getSettings();
+  const targets = [];
   const channelId = s?.requiredChannelId ? Number(s.requiredChannelId) : null;
-  if (channelId && Number.isFinite(channelId)) return [channelId];
+  const groupId = s?.requiredGroupId ? Number(s.requiredGroupId) : null;
+  if (channelId && Number.isFinite(channelId)) targets.push(channelId);
+  if (groupId && Number.isFinite(groupId)) targets.push(groupId);
+  if (targets.length) return [...new Set(targets)];
 
   const configured = s?.jobsTargetChatId ? Number(s.jobsTargetChatId) : null;
   if (configured && Number.isFinite(configured)) return [configured];
@@ -447,21 +451,58 @@ async function announceListenerGroupsProgress(telegram) {
     const settings = await getSettings();
     if (!settings?.botPostingEnabled) return;
 
-    const accounts = await Account.find({ role: 'listener', session: { $nin: [null, ''] } }, 'groups').lean();
-    const keys = new Set();
-    for (const acc of accounts) {
-      for (const g of acc.groups || []) {
-        const idKey = (g?.id || '').toString().trim();
-        if (idKey) keys.add(`id:${idKey}`);
-        const linkKey = normalizeLinkKey(g?.link || '');
-        if (linkKey) keys.add(`link:${linkKey}`);
-      }
-    }
-    const count = keys.size;
-    if (count <= 40) return;
-
+    const agg = await Account.aggregate([
+      { $match: { role: { $ne: 'inviter' } } },
+      { $project: { groups: 1 } },
+      { $unwind: '$groups' },
+      {
+        $project: {
+          idRaw: { $ifNull: ['$groups.id', ''] },
+          linkRaw: { $ifNull: ['$groups.normalizedLink', '$groups.link'] },
+        },
+      },
+      {
+        $project: {
+          idStr: {
+            $cond: [
+              { $and: [{ $ne: ['$idRaw', null] }, { $ne: ['$idRaw', ''] }] },
+              { $toString: '$idRaw' },
+              '',
+            ],
+          },
+          linkStr: {
+            $cond: [
+              { $and: [{ $ne: ['$linkRaw', null] }, { $ne: ['$linkRaw', ''] }] },
+              { $toString: '$linkRaw' },
+              '',
+            ],
+          },
+        },
+      },
+      {
+        $project: {
+          key: {
+            $cond: [
+              { $ne: ['$idStr', ''] },
+              { $concat: ['id:', '$idStr'] },
+              {
+                $cond: [
+                  { $ne: ['$linkStr', ''] },
+                  { $concat: ['link:', { $toLower: '$linkStr' }] },
+                  null,
+                ],
+              },
+            ],
+          },
+        },
+      },
+      { $match: { key: { $ne: null } } },
+      { $group: { _id: '$key' } },
+      { $count: 'count' },
+    ]).allowDiskUse(true);
+    const count = Number(agg?.[0]?.count || 0);
     const lastCount = Number(settings.listenerGroupsAnnouncedCount || 0);
-    if (count <= lastCount) return;
+    if (!(count >= lastCount + 40)) return;
 
     const targets = await getAnnouncementTargetChatIds();
     if (!targets.length) return;
@@ -517,10 +558,22 @@ function truncateLabel(s, max = 36) {
   return v.slice(0, max - 1) + '…';
 }
 
-async function approveChat(chatId, type = 'group', approvedBy = null) {
+async function approveChat(chatId, type = 'group', approvedBy = null, inviteLink = null) {
+  const patch = {
+    chatId: chatId.toString(),
+    type,
+    approvedBy: approvedBy ? approvedBy.toString() : null,
+    approvedAt: new Date(),
+  };
+  const link = inviteLink ? inviteLink.toString().trim() : '';
+  if (link) {
+    patch.inviteLink = link;
+    patch.inviteLinkUpdatedAt = new Date();
+    patch.inviteLinkByAccountId = null;
+  }
   await ApprovedChat.findOneAndUpdate(
     { chatId: chatId.toString() },
-    { $set: { chatId: chatId.toString(), type, approvedBy: approvedBy ? approvedBy.toString() : null, approvedAt: new Date() } },
+    { $set: patch },
     { upsert: true }
   );
   if (type === 'channel') approvedChatCache.channels.add(chatId.toString());
@@ -551,7 +604,9 @@ async function authorizedGroupMiddleware(ctx, next) {
   const cmd = rawText ? rawText.split(/\s+/)[0].toLowerCase() : null;
 
   if (isAdm && cmd === '/approve') {
-    await approveChat(chatId, 'group', from.id).catch(() => {});
+    const uname = chat?.username ? chat.username.toString().replace(/^@/, '').trim() : '';
+    const link = uname ? `https://t.me/${uname}` : null;
+    await approveChat(chatId, 'group', from.id, link).catch(() => {});
     await safeSendMessage(ctx.telegram, from.id, `✅ Group approved: ${chat.title || chatId} (${chatId})`, null, 'approve_group');
     return;
   }
@@ -1837,8 +1892,8 @@ async function handleUserStart(ctx) {
   const hasTimeAccess = now < trialEndsAt || now < subEndsAt;
   const pendingMonths = Number(currentUser?.pendingSubscriptionMonths || 0);
   const pendingOk = pendingMonths > 0;
-  const hasEverHadTimeAccess = !!(currentUser?.trialStartedAt || currentUser?.trialEndsAt || currentUser?.subscriptionEndsAt);
-  const allowJoinLinks = !hasEverHadTimeAccess || hasTimeAccess || pendingOk;
+  const isExpired = !hasTimeAccess && !pendingOk;
+  const allowJoinLinks = isNew || pendingOk;
 
   const requiredChannelIds = (await getMandatoryChannelIds()).map((id) => Number(id)).filter((n) => Number.isFinite(n));
   const requiredGroupIds = (await getMandatoryGroupIds()).map((id) => Number(id)).filter((n) => Number.isFinite(n));
@@ -1854,6 +1909,28 @@ async function handleUserStart(ctx) {
     if (!ok) { missing.push({ kind: 'group', chatId: gid.toString() }); hasAllMembership = false; }
   }
 
+  if (isExpired) {
+    const ids = [...requiredChannelIds, ...requiredGroupIds].map((n) => n?.toString?.()).filter(Boolean);
+    for (const cid of ids) {
+      await removeUserFromChat(ctx.telegram, cid, ctx.from.id, 'start_remove_expired').catch(() => {});
+    }
+    const text =
+      `🔥 🦅 Your access has expired.\n\n` +
+      `Tap “Pay 100 Sujicards” or “Pay 100 Stars” to reactivate your subscription.`;
+    const keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('🪙 Pay 100 Sujicards', 'subscribe_cards'),
+        Markup.button.callback('💳 Pay 100 Stars', 'subscribe_100'),
+      ],
+      [
+        Markup.button.callback('🧾 Balance', 'user_balance'),
+        Markup.button.callback('🔗 Referral', 'user_ref'),
+      ],
+    ]);
+    await replyOrEdit(ctx, text, { disable_web_page_preview: true, ...keyboard }).catch(() => {});
+    return;
+  }
+
   if (missing.length) {
     const name = getFriendlyName(ctx.from);
     if (isNew && allowJoinLinks) {
@@ -1866,15 +1943,10 @@ async function handleUserStart(ctx) {
     }
     if (!allowJoinLinks) {
       const text =
-        `🔥 🦅 Your wings are grounded for now.\n\n` +
-        `Tap “Pay 100 Sujicards” or “Pay 100 Stars” to reactivate your subscription.`;
-      const keyboard = Markup.inlineKeyboard([
-        [
-          Markup.button.callback('🪙 Pay 100 Sujicards', 'subscribe_cards'),
-          Markup.button.callback('💳 Pay 100 Stars', 'subscribe_100'),
-        ],
-      ]);
-      await replyOrEdit(ctx, text, { disable_web_page_preview: true, ...keyboard }).catch(() => {});
+        `🔥 🦅 You must be in the community chats to use Sujini.\n\n` +
+        `If you were removed, rejoin, then tap /start again.\n\n` +
+        `If you need fresh join links, you’ll only get them when you start a new trial or after you pay.`;
+      await replyOrEdit(ctx, text, { disable_web_page_preview: true }).catch(() => {});
       return;
     }
     await sendJoinPromptIfNeeded(ctx, settings, currentUser, missing);
@@ -1886,42 +1958,29 @@ async function handleUserStart(ctx) {
     return;
   }
 
-  const active = hasTimeAccess && hasAllMembership;
   const isTrialActive = now < trialEndsAt;
   const ends = isTrialActive ? new Date(trialEndsAt) : new Date(subEndsAt);
   const msLeft = ends.getTime() - now;
-  const statusLine = active
-    ? (isTrialActive
-        ? `🟢 <b>Status</b>: Trial ends in <b>${escHtml(formatTrialTimeLeft(msLeft))}</b>`
-        : `🟢 <b>Status</b>: Active until <b>${escHtml(formatHumanDate(ends))}</b>`)
-    : `🔴 <b>Status</b>: Inactive`;
+  const statusLine =
+    isTrialActive
+      ? `🟢 <b>Status</b>: Trial ends in <b>${escHtml(formatTrialTimeLeft(msLeft))}</b>`
+      : `🟢 <b>Status</b>: Active until <b>${escHtml(formatHumanDate(ends))}</b>`;
   const text =
     `🔥🦅 <b>Sujini</b>\n\n` +
     `${statusLine}\n\n` +
     `I find developer jobs for you and tell you fast when someone needs a developer.\n` +
     `Keep checking the community group — drops can land anytime.`;
 
-  const keyboard = active
-    ? Markup.inlineKeyboard([
-        [
-          Markup.button.callback('🧾 Balance', 'user_balance'),
-          Markup.button.callback('🔗 Referral', 'user_ref'),
-        ],
-        [
-          Markup.button.callback('🏆 Leaderboard', 'user_leaderboard'),
-          Markup.button.callback('🪙 Pay 100 Sujicards', 'subscribe_cards'),
-        ],
-      ])
-    : Markup.inlineKeyboard([
-        [
-          Markup.button.callback('🪙 Pay 100 Sujicards', 'subscribe_cards'),
-          Markup.button.callback('💳 Pay 100 Stars', 'subscribe_100'),
-        ],
-        [
-          Markup.button.callback('🧾 Balance', 'user_balance'),
-          Markup.button.callback('🔗 Referral', 'user_ref'),
-        ],
-      ]);
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('🧾 Balance', 'user_balance'),
+      Markup.button.callback('🔗 Referral', 'user_ref'),
+    ],
+    [
+      Markup.button.callback('🏆 Leaderboard', 'user_leaderboard'),
+      Markup.button.callback('🪙 Pay 100 Sujicards', 'subscribe_cards'),
+    ],
+  ]);
 
   await replyOrEdit(ctx, text, { parse_mode: 'HTML', disable_web_page_preview: true, ...keyboard });
 }

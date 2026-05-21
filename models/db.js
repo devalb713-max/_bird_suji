@@ -16,7 +16,9 @@ const accountSchema = new mongoose.Schema(
     userId: { type: String, default: null },
     session: { type: String, default: null },
     role: { type: String, enum: ['listener', 'preacher', 'finder', 'inviter'], default: 'listener' },
-    groups: [{ id: String, name: String, link: String }],
+    groups: [{ id: String, name: String, link: String, normalizedLink: String }],
+    groupsSyncedAt: { type: Date, default: null },
+    groupsSyncError: { type: String, default: null },
     searchLimitHit: { type: Boolean, default: false },
     searchLimitResetsAt: { type: Date, default: null },
     searchBotStartedAt: { type: Date, default: null },
@@ -36,6 +38,8 @@ const accountSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+accountSchema.index({ role: 1, 'groups.normalizedLink': 1 });
+accountSchema.index({ role: 1, 'groups.id': 1 });
 export const Account = mongoose.model('Account', accountSchema);
 
 const keywordSchema = new mongoose.Schema(

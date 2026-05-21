@@ -1,5 +1,5 @@
 import { Api } from 'telegram/tl/index.js';
-import { Account, Keyword, BotChat, GroupLink } from '../models/db.js';
+import { Account, Keyword, BotChat, GroupLink, ApprovedChat, BotSettings } from '../models/db.js';
 import { createClient, sendWithTyping, extractUsernameFromLink, extractInviteHash, sleep, isFloodError, getFloodSeconds, isAuthError } from './telegram.js';
 import { addGroup } from './groupRegistry.js';
 
@@ -41,30 +41,70 @@ async function getAllJoinedGroupLinks() {
   return links;
 }
 
-async function getAllPreacherGroupLinks(exceptAccountId) {
-  const q = { role: 'preacher' };
-  const accounts = await Account.find(q, 'groups.link _id');
-  const links = new Set();
-  for (const acc of accounts) {
-    if (exceptAccountId && acc._id?.toString() === exceptAccountId.toString()) continue;
-    for (const g of acc.groups) {
-      if (g.link) links.add(normalizeTmeLink(g.link));
-    }
-  }
-  return links;
+let _approvedGroupsCache = { loadedAt: 0, ids: new Set(), links: new Set() };
+
+function isApprovedIdMatch(resolvedEntityId, approvedIdSet) {
+  const id = resolvedEntityId?.toString?.() || '';
+  if (!id) return false;
+  if (approvedIdSet.has(id)) return true;
+  if (approvedIdSet.has(`-${id}`)) return true;
+  if (approvedIdSet.has(`-100${id}`)) return true;
+  return false;
 }
 
-async function getAllListenerGroupLinks(exceptAccountId) {
-  const q = { role: 'listener' };
-  const accounts = await Account.find(q, 'groups.link _id');
+async function getApprovedGroupExemptions() {
+  const stale = !_approvedGroupsCache.loadedAt || (Date.now() - _approvedGroupsCache.loadedAt) > 60 * 1000;
+  if (!stale) return _approvedGroupsCache;
+
+  const [settings, rows] = await Promise.all([
+    BotSettings.findOne({}, { requiredGroupId: 1, requiredGroupInviteLink: 1 }).lean().catch(() => null),
+    ApprovedChat.find({ type: 'group' }, { chatId: 1, inviteLink: 1 }).lean().catch(() => []),
+  ]);
+
+  const ids = new Set();
   const links = new Set();
-  for (const acc of accounts) {
-    if (exceptAccountId && acc._id?.toString() === exceptAccountId.toString()) continue;
-    for (const g of acc.groups) {
-      if (g.link) links.add(normalizeTmeLink(g.link));
-    }
+
+  const requiredId = settings?.requiredGroupId ? settings.requiredGroupId.toString() : '';
+  if (requiredId) ids.add(requiredId);
+  const requiredLink = settings?.requiredGroupInviteLink ? normalizeTmeLink(settings.requiredGroupInviteLink) : '';
+  if (requiredLink) links.add(requiredLink);
+
+  for (const r of rows || []) {
+    const cid = r?.chatId ? r.chatId.toString() : '';
+    if (cid) ids.add(cid);
+    const l = r?.inviteLink ? normalizeTmeLink(r.inviteLink) : '';
+    if (l) links.add(l);
   }
-  return links;
+
+  _approvedGroupsCache = { loadedAt: Date.now(), ids, links };
+  return _approvedGroupsCache;
+}
+
+async function isApprovedBotGroup({ normalizedLink, resolvedEntityId }) {
+  const link = normalizedLink ? normalizeTmeLink(normalizedLink) : '';
+  if (!link) return false;
+  const { ids, links } = await getApprovedGroupExemptions();
+  if (links.has(link)) return true;
+  if (resolvedEntityId && isApprovedIdMatch(resolvedEntityId, ids)) return true;
+  return false;
+}
+
+async function isGroupTakenByListenerOrPreacher(exceptAccountId, normalizedLink, resolvedEntityId = null) {
+  const link = normalizedLink ? normalizeTmeLink(normalizedLink) : '';
+  if (!link) return false;
+  if (await isApprovedBotGroup({ normalizedLink: link, resolvedEntityId })) return false;
+  const ors = [
+    { 'groups.normalizedLink': link },
+    { 'groups.link': link },
+  ];
+  const entId = resolvedEntityId?.toString?.() || '';
+  if (entId) ors.push({ 'groups.id': entId });
+  const exists = await Account.exists({
+    role: { $in: ['listener', 'preacher'] },
+    _id: { $ne: exceptAccountId },
+    $or: ors,
+  }).catch(() => null);
+  return !!exists;
 }
 
 function listenerGroupKey(g) {
@@ -539,23 +579,6 @@ async function runJoinFromDb(accountId, flag) {
     }
 
     const link = linkDoc.normalizedLink;
-    if (role === 'preacher') {
-      const preacherLinks = await getAllPreacherGroupLinks(accountId);
-      if (preacherLinks.has(link)) {
-        await GroupLink.deleteOne({ _id: linkDoc._id });
-        await sleep(3000 + Math.random() * 3000);
-        continue;
-      }
-    }
-    if (role === 'listener') {
-      const listenerLinks = await getAllListenerGroupLinks(accountId);
-      if (listenerLinks.has(link)) {
-        await markLink(linkDoc, { status: 'dead', lastError: 'listener_overlap' });
-        await sleep(2000 + Math.random() * 2000);
-        continue;
-      }
-    }
-
     const client = createClient(account.session, accountId);
     try {
       await client.connect();
@@ -563,6 +586,23 @@ async function runJoinFromDb(accountId, flag) {
       const refreshed = client.session.save();
       if (refreshed && refreshed !== account.session) {
         await Account.updateOne({ _id: accountId }, { session: refreshed });
+      }
+
+      let resolvedEntityForCheck = null;
+      try {
+        const hash = extractInviteHash(link);
+        if (!hash) {
+          const uname = extractUsernameFromLink(link);
+          if (uname) resolvedEntityForCheck = await client.getEntity(uname);
+        }
+      } catch {}
+
+      const taken = await isGroupTakenByListenerOrPreacher(accountId, link, resolvedEntityForCheck?.id);
+      if (taken) {
+        await markLink(linkDoc, { status: 'dead', lastError: 'taken' });
+        await client.disconnect();
+        await sleep(2000 + Math.random() * 2000);
+        continue;
       }
 
       const { joined, entity: joinedEntity } = await joinGroupLink(client, link);
@@ -581,7 +621,7 @@ async function runJoinFromDb(accountId, flag) {
         continue;
       }
 
-      let groupInfo = { link, name: link, id: link };
+      let groupInfo = { link, name: link, id: link, normalizedLink: link };
       let resolvedEntity = joinedEntity;
       if (!resolvedEntity) {
         try {
@@ -594,6 +634,7 @@ async function runJoinFromDb(accountId, flag) {
           id: resolvedEntity.id?.toString() || link,
           name: resolvedEntity.title || link,
           link,
+          normalizedLink: link,
         };
       }
 
@@ -649,6 +690,100 @@ async function runJoinFromDb(accountId, flag) {
   }
 
   await Account.updateOne({ _id: accountId }, { isJoining: false });
+}
+
+let membershipSyncRunning = false;
+
+function isGroupishEntity(ent) {
+  if (!ent) return false;
+  if (ent.className === 'Chat') return true;
+  if (ent.className === 'Channel' && ent.megagroup) return true;
+  return false;
+}
+
+function buildGroupSnapshotFromDialogs(dialogs, existingGroups) {
+  const existingById = new Map();
+  for (const g of existingGroups || []) {
+    const id = g?.id?.toString?.() || '';
+    if (id) existingById.set(id, g);
+  }
+
+  const out = [];
+  const seen = new Set();
+  for (const d of dialogs || []) {
+    const ent = d?.entity || null;
+    if (!isGroupishEntity(ent)) continue;
+    const id = ent?.id?.toString?.() || '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+
+    const name = ent?.title?.toString?.() || id;
+    const uname = ent?.username?.toString?.().replace(/^@/, '').trim() || '';
+    const freshLink = uname ? `https://t.me/${uname}` : null;
+
+    const prev = existingById.get(id) || null;
+    const link = freshLink || (prev?.link ? prev.link.toString() : null);
+    const normalizedLink = link ? normalizeTmeLink(link) : null;
+
+    out.push({ id, name, link, normalizedLink });
+  }
+  return out;
+}
+
+export async function syncListenerAndPreacherGroupsOnce() {
+  if (membershipSyncRunning) return;
+  membershipSyncRunning = true;
+  try {
+    const accounts = await Account.find(
+      { role: { $in: ['listener', 'preacher'] }, session: { $nin: [null, ''] } },
+      { _id: 1, session: 1, groups: 1, username: 1, number: 1 }
+    ).lean();
+
+    for (const acc of accounts || []) {
+      const label = acc.username || acc.number || acc._id?.toString?.() || 'account';
+      const client = createClient(acc.session, acc._id);
+      try {
+        await client.connect();
+        const refreshed = client.session.save();
+        if (refreshed && refreshed !== acc.session) {
+          await Account.updateOne({ _id: acc._id }, { session: refreshed }).catch(() => {});
+        }
+
+        const dialogs = await client.getDialogs({ limit: 600 }).catch(() => []);
+        const groups = buildGroupSnapshotFromDialogs(dialogs, acc.groups);
+        await Account.updateOne(
+          { _id: acc._id },
+          { $set: { groups, groupsSyncedAt: new Date(), groupsSyncError: null } }
+        ).catch(() => {});
+      } catch (err) {
+        if (isAuthError(err)) {
+          await Account.updateOne(
+            { _id: acc._id },
+            { $set: { groupsSyncedAt: new Date(), groupsSyncError: 'auth_error' } }
+          ).catch(() => {});
+        } else if (isFloodError(err)) {
+          const secs = getFloodSeconds(err);
+          await Account.updateOne(
+            { _id: acc._id },
+            { $set: { groupsSyncedAt: new Date(), groupsSyncError: `flood_${secs}s` } }
+          ).catch(() => {});
+          await sleep(secs * 1000);
+        } else {
+          await Account.updateOne(
+            { _id: acc._id },
+            { $set: { groupsSyncedAt: new Date(), groupsSyncError: (err?.message || 'error').toString().slice(0, 180) } }
+          ).catch(() => {});
+        }
+        console.log(`[GroupsSync] ${label} sync error: ${err?.message || 'error'}`);
+      } finally {
+        try { await client.disconnect(); } catch {}
+      }
+
+      await sleep(1500 + Math.random() * 1500);
+    }
+  } finally {
+    membershipSyncRunning = false;
+  }
 }
 
 export async function enforceUniqueListenerGroupsOnce() {

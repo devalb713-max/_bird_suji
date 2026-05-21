@@ -1,5 +1,5 @@
 import { Account } from '../models/db.js';
-import { runGroupJoiner, enforceUniqueListenerGroupsOnce } from '../helpers/groupJoiner.js';
+import { runGroupJoiner, enforceUniqueListenerGroupsOnce, syncListenerAndPreacherGroupsOnce } from '../helpers/groupJoiner.js';
 
 // In-memory control flags per accountId
 const joinFlags = new Map();
@@ -124,6 +124,7 @@ export function startPoller() {
   pollerStarted = true;
   const POLL_INTERVAL = 60000;
   const DEDUPE_INTERVAL = Math.max(60_000, Number(process.env.LISTENER_DEDUPE_INTERVAL_MS || 5 * 60 * 1000));
+  const GROUP_SYNC_INTERVAL = Math.max(60_000, Number(process.env.ACCOUNT_GROUPS_SYNC_INTERVAL_MS || 5 * 60 * 1000));
 
   setInterval(async () => {
     try {
@@ -150,6 +151,12 @@ export function startPoller() {
       }
     }
   }, POLL_INTERVAL);
+
+  syncListenerAndPreacherGroupsOnce().catch(() => {});
+  const g = setInterval(() => {
+    syncListenerAndPreacherGroupsOnce().catch(() => {});
+  }, GROUP_SYNC_INTERVAL);
+  if (g?.unref) g.unref();
 
   setInterval(async () => {
     if (listenerDedupeRunning) return;

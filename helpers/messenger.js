@@ -684,10 +684,62 @@ async function isBotManagedChat(entityId, storedGroupId) {
   const ids = [
     entityId?.toString(),
     entityId ? `-100${entityId}` : null,
+    entityId ? `-${entityId}` : null,
     storedGroupId || null,
   ].filter(Boolean);
   if (!ids.length) return false;
   return !!(await BotChat.exists({ chatId: { $in: ids } }));
+}
+
+let _approvedBotGroupIdsCache = { loadedAt: 0, ids: new Set() };
+let _approvedBotGroupLinksCache = { loadedAt: 0, links: new Set() };
+
+async function getApprovedBotGroupIds() {
+  const stale = !_approvedBotGroupIdsCache.loadedAt || (Date.now() - _approvedBotGroupIdsCache.loadedAt) > 60 * 1000;
+  if (!stale && _approvedBotGroupIdsCache.ids?.size) return _approvedBotGroupIdsCache.ids;
+
+  const rows = await ApprovedChat.find({ type: 'group' }, { chatId: 1 }).lean().catch(() => []);
+  const ids = new Set(rows.map(r => (r?.chatId || '').toString()).filter(Boolean));
+  _approvedBotGroupIdsCache = { loadedAt: Date.now(), ids };
+  return ids;
+}
+
+async function getApprovedBotGroupLinks() {
+  const stale = !_approvedBotGroupLinksCache.loadedAt || (Date.now() - _approvedBotGroupLinksCache.loadedAt) > 60 * 1000;
+  if (!stale && _approvedBotGroupLinksCache.links?.size) return _approvedBotGroupLinksCache.links;
+
+  const [settings, rows] = await Promise.all([
+    BotSettings.findOne({}, { requiredGroupInviteLink: 1 }).lean().catch(() => null),
+    ApprovedChat.find({ type: 'group', inviteLink: { $nin: [null, ''] } }, { inviteLink: 1 }).lean().catch(() => []),
+  ]);
+
+  const links = new Set();
+  const required = settings?.requiredGroupInviteLink ? normalizeTmeLink(settings.requiredGroupInviteLink) : '';
+  if (required) links.add(required);
+  for (const r of rows || []) {
+    const l = r?.inviteLink ? normalizeTmeLink(r.inviteLink) : '';
+    if (l) links.add(l);
+  }
+
+  _approvedBotGroupLinksCache = { loadedAt: Date.now(), links };
+  return links;
+}
+
+async function isApprovedBotGroupChat(entityId, storedGroupId, link) {
+  const ids = [
+    entityId?.toString(),
+    entityId ? `-${entityId}` : null,
+    entityId ? `-100${entityId}` : null,
+    storedGroupId?.toString?.() || null,
+  ].filter(Boolean);
+
+  const idSet = await getApprovedBotGroupIds();
+  if (ids.some((x) => idSet.has(x))) return true;
+
+  const l = link ? normalizeTmeLink(link) : '';
+  if (!l) return false;
+  const linkSet = await getApprovedBotGroupLinks();
+  return linkSet.has(l);
 }
 
 async function leaveAndRemoveGroup(client, accountId, group) {
@@ -765,17 +817,22 @@ async function prunePreacherOverlaps(client, accountId) {
   const meAcc = await Account.findById(accountId, 'groups role');
   if (!meAcc || meAcc.role !== 'preacher') return;
 
-  const others = await Account.find({ role: 'preacher', _id: { $ne: accountId } }, 'groups.link');
+  const others = await Account.find(
+    { role: { $in: ['preacher', 'listener'] }, _id: { $ne: accountId } },
+    'groups.link groups.normalizedLink'
+  );
   const taken = new Set();
   for (const acc of others) {
     for (const g of acc.groups || []) {
-      if (g.link) taken.add(g.link.toLowerCase().trim());
+      const key = (g.normalizedLink || g.link || '').toLowerCase().trim();
+      if (key) taken.add(key);
     }
   }
 
   for (const g of meAcc.groups || []) {
-    const key = (g.link || '').toLowerCase().trim();
+    const key = (g.normalizedLink || g.link || '').toLowerCase().trim();
     if (!key) continue;
+    if (await isApprovedBotGroupChat(null, g.id, g.link)) continue;
     if (!taken.has(key)) continue;
     await leaveAndRemoveGroup(client, accountId, g);
     await sleep(3000 + Math.random() * 4000);
@@ -808,6 +865,11 @@ async function runListener(accountId, flag) {
     let processing = false;
     let lastListenerEventAt = Date.now();
     let lastDbSeenAt = 0;
+    let lastDialogsWarmAt = 0;
+    const KEEPALIVE_MS = Math.max(20_000, Number(process.env.LISTENER_KEEPALIVE_MS || 60_000));
+    const DIALOGS_WARM_MS = Math.max(20_000, Number(process.env.LISTENER_DIALOGS_WARM_MS || 60_000));
+    const RECONNECT_IDLE_MS = Math.max(2 * 60_000, Number(process.env.LISTENER_RECONNECT_IDLE_MS || 12 * 60_000));
+    const MAX_QUEUE = Math.max(50, Number(process.env.LISTENER_MAX_QUEUE || 300));
 
     const markListenerConnected = async () => {
       await Account.updateOne(
@@ -926,14 +988,15 @@ async function runListener(accountId, flag) {
             const messageId = Number.isFinite(message?.id) ? message.id : null;
             const text = (message?.text || message?.message || '').toString();
             const isGroup = !!event?.isGroup;
+            const isChannel = !!event?.isChannel;
             const isPrivate = !!event?.isPrivate;
             const isOut = !!message?.out;
 
             let dropReason = null;
             if (!message) dropReason = 'no_message';
             else if (isOut) dropReason = 'out';
-            else if (!isGroup) dropReason = 'not_group';
             else if (isPrivate) dropReason = 'private';
+            else if (!(isGroup || isChannel)) dropReason = 'not_groupish';
             else if (!text.trim()) dropReason = 'no_text';
 
             lastListenerEventAt = Date.now();
@@ -944,6 +1007,7 @@ async function runListener(accountId, flag) {
               chatId,
               messageId,
               isGroup,
+              isChannel,
               isPrivate,
               isOut,
               textChars: text.length,
@@ -953,6 +1017,10 @@ async function runListener(accountId, flag) {
             //#endregion debug-point listener-missing-messages listener.new_message
 
             if (dropReason) return;
+            if (queue.length >= MAX_QUEUE) {
+              const over = queue.length - MAX_QUEUE + 1;
+              if (over > 0) queue.splice(0, over);
+            }
             queue.push(message);
             markListenerSeen({ chatId: normalizeMessageChatId(chatId), messageId }).catch(() => {});
             processQueue().catch(() => {});
@@ -972,8 +1040,21 @@ async function runListener(accountId, flag) {
           await client.getMe();
           await client.invoke(new Api.updates.GetState()).catch(() => {});
           await setClientOnline(client);
-          if (idleMs > 2 * 60 * 1000) {
-            await client.getDialogs({ limit: 20 }).catch(() => {});
+          if (Date.now() - lastDialogsWarmAt >= DIALOGS_WARM_MS) {
+            lastDialogsWarmAt = Date.now();
+            await client.getDialogs({ limit: 120 }).catch(() => {});
+          }
+          if (idleMs >= RECONNECT_IDLE_MS) {
+            try { await client.disconnect(); } catch {}
+            await sleep(1500 + Math.random() * 1500);
+            await client.connect();
+            await client.getMe();
+            await client.invoke(new Api.updates.GetState()).catch(() => {});
+            await client.getDialogs({ limit: 120 }).catch(() => {});
+            await setClientOnline(client);
+            await markListenerConnected();
+            lastListenerEventAt = Date.now();
+            lastDialogsWarmAt = Date.now();
           }
         } catch (err) {
           if (isAuthError(err)) fatalAuthErr = err;
@@ -985,13 +1066,13 @@ async function runListener(accountId, flag) {
               await client.connect();
               await client.getMe();
               await client.invoke(new Api.updates.GetState()).catch(() => {});
-              await client.getDialogs({ limit: 20 }).catch(() => {});
+              await client.getDialogs({ limit: 120 }).catch(() => {});
               await setClientOnline(client);
               await markListenerConnected();
             } catch {}
           }
         }
-        await sleep(30000);
+        await sleep(KEEPALIVE_MS);
       }
 
     } catch (err) {
@@ -1039,15 +1120,45 @@ async function markGroupLink(linkDoc, patch) {
   await GroupLink.updateOne({ _id: linkDoc._id }, { $set: patch }).catch(() => {});
 }
 
-async function getOtherPreacherLinks(exceptAccountId) {
-  const accounts = await Account.find({ role: 'preacher', _id: { $ne: exceptAccountId } }, 'groups.link');
+async function releaseStaleGroupLinkClaims(maxAgeMs = 30 * 60 * 1000) {
+  const cutoff = new Date(Date.now() - maxAgeMs);
+  await GroupLink.updateMany(
+    { status: 'claimed', claimedAt: { $ne: null, $lte: cutoff } },
+    { $set: { status: 'new', claimedByAccountId: null, claimedRole: null, claimedAt: null } }
+  ).catch(() => {});
+}
+
+async function getTakenGroupLinks(exceptAccountId) {
+  const accounts = await Account.find(
+    { role: { $in: ['listener', 'preacher'] }, _id: { $ne: exceptAccountId } },
+    'groups.link groups.normalizedLink'
+  );
   const links = new Set();
   for (const acc of accounts) {
     for (const g of acc.groups || []) {
-      if (g.link) links.add(normalizeTmeLink(g.link));
+      const key = g.normalizedLink || g.link || '';
+      if (key) links.add(normalizeTmeLink(key));
     }
   }
   return links;
+}
+
+async function isGroupTakenByListenerOrPreacher(exceptAccountId, normalizedLink, resolvedEntityId = null) {
+  const link = normalizedLink ? normalizeTmeLink(normalizedLink) : '';
+  if (!link) return false;
+  if (await isApprovedBotGroupChat(resolvedEntityId, null, link)) return false;
+  const ors = [
+    { 'groups.normalizedLink': link },
+    { 'groups.link': link },
+  ];
+  const entId = resolvedEntityId?.toString?.() || '';
+  if (entId) ors.push({ 'groups.id': entId });
+  const exists = await Account.exists({
+    role: { $in: ['listener', 'preacher'] },
+    _id: { $ne: exceptAccountId },
+    $or: ors,
+  }).catch(() => null);
+  return !!exists;
 }
 
 async function joinGroupLink(client, link, retried = false) {
@@ -1134,6 +1245,7 @@ async function runPreacher(accountId, flag) {
 
             if (entity.broadcast) continue;
             if (await isBotManagedChat(entity.id, group.id)) continue;
+            if (await isApprovedBotGroupChat(entity.id, group.id, group.link)) continue;
 
             try {
               const hasOwn = await hasOwnMessageInLast30(client, entity, me.id);
@@ -1202,7 +1314,8 @@ async function runPreacher(accountId, flag) {
 
         const joinBatch = 25;
         let joinedThisPhase = 0;
-        const otherPreacherLinks = await getOtherPreacherLinks(accountId);
+        await releaseStaleGroupLinkClaims();
+        const takenLinks = await getTakenGroupLinks(accountId);
 
         while (flag.running) {
           const acc = await Account.findById(accountId, 'groups');
@@ -1214,8 +1327,25 @@ async function runPreacher(accountId, flag) {
           if (!linkDoc) break;
 
           const link = normalizeTmeLink(linkDoc.normalizedLink || linkDoc.link);
-          if (otherPreacherLinks.has(link)) {
-            await GroupLink.deleteOne({ _id: linkDoc._id }).catch(() => {});
+          if (takenLinks.has(link)) {
+            await markGroupLink(linkDoc, { status: 'dead', lastError: 'taken' });
+            await sleep(2000 + Math.random() * 3000);
+            continue;
+          }
+
+          let resolvedEntityId = null;
+          try {
+            const uname = extractUsernameFromLink(link);
+            if (uname) {
+              const ent = await client.getEntity(uname);
+              resolvedEntityId = ent?.id || null;
+            }
+          } catch {}
+
+          const takenNow = await isGroupTakenByListenerOrPreacher(accountId, link, resolvedEntityId);
+          if (takenNow) {
+            await markGroupLink(linkDoc, { status: 'dead', lastError: 'taken' });
+            takenLinks.add(link);
             await sleep(2000 + Math.random() * 3000);
             continue;
           }
@@ -1253,13 +1383,14 @@ async function runPreacher(accountId, flag) {
             id: resolvedEntity.id?.toString() || link,
             name: resolvedEntity.title || link,
             link,
-          } : { id: link, name: link, link };
+            normalizedLink: link,
+          } : { id: link, name: link, link, normalizedLink: link };
 
           await Account.updateOne({ _id: accountId }, { $addToSet: { groups: groupInfo } });
           addGroup(accountId, groupInfo);
           await markGroupLink(linkDoc, { status: 'joined', joinedByAccountId: accountId.toString(), joinedRole: 'preacher', joinedAt: new Date() });
           joinedThisPhase++;
-          otherPreacherLinks.add(link);
+          takenLinks.add(link);
 
           await sleep(15000 + Math.random() * 20000);
         }
