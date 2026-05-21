@@ -157,11 +157,11 @@ async function enqueueJobDmBlastFromBot(text, replyMarkup, key) {
 
 function parseTelegramMessageLink(text = '') {
   const s = (text || '').toString();
-  const m = s.match(/https?:\/\/t\.me\/([a-zA-Z0-9_]+)\/(\d+)/i);
+  const m = s.match(/(?:https?:\/\/)?t\.me\/([a-zA-Z0-9_]+)\/(\d+)/i);
   if (m?.[1] && m?.[2] && m[1].toLowerCase() !== 'c') {
     return { kind: 'username', username: m[1], messageId: Number(m[2]) };
   }
-  const m2 = s.match(/https?:\/\/t\.me\/c\/(\d+)\/(\d+)/i);
+  const m2 = s.match(/(?:https?:\/\/)?t\.me\/c\/(\d+)\/(\d+)/i);
   if (m2?.[1] && m2?.[2]) {
     return { kind: 'c', internalId: m2[1], messageId: Number(m2[2]) };
   }
@@ -350,7 +350,18 @@ async function handleManualPasteLink(ctx) {
     if (!text) return false;
 
     const linkInfo = parseTelegramMessageLink(text);
-    if (!linkInfo) return false;
+    if (!linkInfo) {
+      if (/t\.me\//i.test(text)) {
+        await ctx
+          .reply(
+            "Can't create preview for this link.\n\nUnsupported link format. Use:\n- https://t.me/<username>/<messageId>\n- https://t.me/c/<internalId>/<messageId>",
+            { disable_web_page_preview: true }
+          )
+          .catch(() => {});
+        return true;
+      }
+      return false;
+    }
 
     const res = await tryFetchMessageFromLink(linkInfo);
     if (!res.ok || !res.payload) {
@@ -4222,7 +4233,6 @@ async function membershipSweep(telegram) {
 
 export async function handleMessage(ctx) {
   if (ctx.message?.successful_payment) return handleSuccessfulPayment(ctx);
-  if (!getSession(ctx.from?.id)) {
   const settingsForDump = await getSettings().catch(() => null);
   const dumpId = settingsForDump?.reviewDumpChatId ? settingsForDump.reviewDumpChatId.toString() : null;
   const isDumpChat =
@@ -4235,12 +4245,10 @@ export async function handleMessage(ctx) {
     if (handledPaste) return;
     const handledFwd = await handleManualForwardRepost(ctx);
     if (handledFwd) return;
-  }
-
+  } else {
     const handled = await handleManualForwardRepost(ctx);
     if (handled) return;
   }
-
 
   const session = getSession(ctx.from?.id);
   if (!session) return;
