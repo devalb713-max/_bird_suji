@@ -3,7 +3,7 @@ import { NewMessage } from 'telegram/events/index.js';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { Telegram } from 'telegraf';
-import { Account, Admin, ApprovedChat, BotSettings, BotChat, MessageTemplate, QueuedPost, GroupLink, AiQueueMessage, PostDedupe } from '../models/db.js';
+import { Account, Admin, ApprovedChat, BotSettings, BotChat, MessageTemplate, QueuedPost, GroupLink, AiQueueMessage, PostDedupe, BotUser, JobDmBlast } from '../models/db.js';
 import {
   createClient,
   extractUsernameFromLink,
@@ -26,6 +26,8 @@ const botTelegram = new Telegram(process.env.BOT_TOKEN);
 let _promptTemplate = null;
 let _logoBytes = null;
 let _jobTargetsCache = { loadedAt: 0, ids: [] };
+let _jobDmStarted = false;
+let _jobDmRunning = false;
 
 const LISTENER_TRACE = process.env.LISTENER_TRACE === '1';
 const LISTENER_TRACE_TEXT_CHARS = Math.max(80, Math.min(2000, Number(process.env.LISTENER_TRACE_TEXT_CHARS || 700)));
@@ -95,6 +97,154 @@ function listenerTrace(event, payload) {
 function llmLog(event, payload) {
   const suffix = payload === undefined ? '' : ` ${safeTraceStringify(payload)}`;
   console.log(`[LLM] ${event}${suffix}`);
+}
+
+function createRateLimitedQueue(perSecond = 25) {
+  const intervalMs = Math.max(10, Math.floor(1000 / perSecond));
+  const queue = [];
+  let timer = null;
+  let active = false;
+  let idleResolvers = [];
+
+  const resolveIdleIfNeeded = () => {
+    if (active || queue.length) return;
+    const list = idleResolvers;
+    idleResolvers = [];
+    for (const r of list) r();
+  };
+
+  const tick = async () => {
+    if (active) return;
+    const job = queue.shift();
+    if (!job) {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      resolveIdleIfNeeded();
+      return;
+    }
+    active = true;
+    try {
+      await job();
+    } catch {}
+    active = false;
+    resolveIdleIfNeeded();
+  };
+
+  const start = () => {
+    if (timer) return;
+    timer = setInterval(() => tick().catch(() => {}), intervalMs);
+    tick().catch(() => {});
+  };
+
+  return {
+    enqueue(fn) {
+      queue.push(fn);
+      start();
+    },
+    size() {
+      return queue.length + (active ? 1 : 0);
+    },
+    onIdle() {
+      if (!queue.length && !active) return Promise.resolve();
+      return new Promise(r => idleResolvers.push(r));
+    },
+  };
+}
+
+const dmQueue = createRateLimitedQueue(25);
+
+function isBlockedUserError(err) {
+  const desc = (err?.description ?? err?.message ?? '').toString().toLowerCase();
+  return desc.includes('bot was blocked by the user') ||
+    desc.includes('user is deactivated') ||
+    desc.includes('chat not found');
+}
+
+async function waitForDmQueueBelow(maxSize = 3000) {
+  while (dmQueue.size() > maxSize) {
+    await sleep(250);
+  }
+}
+
+async function enqueueJobDmBlast(text, replyMarkup, key) {
+  if (!text || !key) return;
+  await JobDmBlast.updateOne(
+    { key },
+    { $setOnInsert: { status: 'pending', lockedAt: null, key, text: text.toString(), replyMarkup: replyMarkup || null, lastUserId: null, sent: 0, failed: 0 } },
+    { upsert: true }
+  ).catch(() => {});
+}
+
+async function claimJobDmBlast() {
+  const now = new Date();
+  const cutoff = new Date(Date.now() - 30 * 60 * 1000);
+  await JobDmBlast.updateMany(
+    { status: 'processing', lockedAt: { $lt: cutoff } },
+    { $set: { status: 'pending' }, $unset: { lockedAt: 1 } }
+  ).catch(() => {});
+  return JobDmBlast.findOneAndUpdate(
+    { status: 'pending' },
+    { $set: { status: 'processing', lockedAt: now } },
+    { sort: { createdAt: 1 }, new: true }
+  ).lean().catch(() => null);
+}
+
+async function processJobDmOnce() {
+  if (_jobDmRunning) return;
+  _jobDmRunning = true;
+  try {
+    const job = await claimJobDmBlast();
+    if (!job?._id) return;
+
+    const batchSize = 500;
+    const q = { bannedAt: null, mandatoryJoinedAt: { $ne: null } };
+    let lastId = job.lastUserId || null;
+    let sent = job.sent || 0;
+    let failed = job.failed || 0;
+
+    while (true) {
+      const qq = { ...q };
+      if (lastId) qq._id = { $gt: lastId };
+      const users = await BotUser.find(qq, { userId: 1 }).sort({ _id: 1 }).limit(batchSize).lean().catch(() => []);
+      if (!users.length) break;
+      lastId = users[users.length - 1]._id.toString();
+
+      for (const u of users) {
+        const uid = u?.userId?.toString?.() || '';
+        if (!uid) continue;
+        dmQueue.enqueue(async () => {
+          try {
+            await botTelegram.sendMessage(uid, job.text, { disable_web_page_preview: true, parse_mode: 'HTML', reply_markup: job.replyMarkup || undefined });
+            sent++;
+          } catch (err) {
+            failed++;
+            if (isBlockedUserError(err)) {
+              await BotUser.deleteOne({ userId: uid }).catch(() => {});
+            }
+          }
+        });
+      }
+
+      await waitForDmQueueBelow(3000);
+      await JobDmBlast.updateOne({ _id: job._id }, { $set: { lastUserId: lastId } }).catch(() => {});
+    }
+
+    await dmQueue.onIdle();
+    await JobDmBlast.updateOne({ _id: job._id }, { $set: { status: 'done', lockedAt: null, lastUserId: lastId, sent, failed } }).catch(() => {});
+  } finally {
+    _jobDmRunning = false;
+  }
+}
+
+function startJobDmProcessor() {
+  if (_jobDmStarted) return;
+  _jobDmStarted = true;
+  const intervalMs = Math.max(5_000, Number(process.env.JOB_DM_INTERVAL_MS || 10_000));
+  processJobDmOnce().catch(() => {});
+  const t = setInterval(() => processJobDmOnce().catch(() => {}), intervalMs);
+  if (t?.unref) t.unref();
 }
 
 async function getSettings() {
@@ -177,6 +327,9 @@ function scoreJobHeuristics(textRaw = '') {
   const t = text.toLowerCase();
   const matched = [];
   let score = 0;
+  let devScore = 0;
+  let jobScore = 0;
+  let negScore = 0;
 
   const hit = (name, rx, points = 1) => {
     if (!rx.test(t)) return;
@@ -184,31 +337,51 @@ function scoreJobHeuristics(textRaw = '') {
     score += points;
   };
 
-  hit('hiring', /\b(we'?re hiring|we are hiring|hiring now|now hiring|hiring|hire)\b/i, 3);
-  hit('recruiting', /\b(recruiting|recruiter|recruitment|staffing|talent acquisition)\b/i, 2);
-  hit('looking_for', /\b(looking for|seeking|in search of|need (a|an)|want (a|an))\b/i, 2);
-  hit('open_roles', /\b(open position|openings|vacancy|role|position|job (opening|opportunity)?)\b/i, 2);
-  hit('apply', /\b(apply|application|submit (your )?(cv|resume)|send (your )?(cv|resume)|interview)\b/i, 1);
-  hit('contract_terms', /\b(contract|freelance|part[-\s]?time|full[-\s]?time|remote|hybrid|on[-\s]?site|wfh)\b/i, 1);
-  hit('stack_signal', /\b(tech stack|stack|requirements|responsibilities|experience|years? of experience)\b/i, 1);
-  hit('rate_money', /(\$|€|£|₦|₹)\s?\d|(\b(usd|eur|gbp|ngn|inr|cad|aud)\b)\s?\d|\b(budget|rate|salary|compensation|paid)\b/i, 2);
-  hit('contact', /\b(dm|pm|reach out|contact me|telegram me|send message)\b/i, 1);
+  const hitJob = (name, rx, points = 1) => {
+    if (!rx.test(t)) return;
+    matched.push(name);
+    jobScore += points;
+  };
+  const hitDev = (name, rx, points = 1) => {
+    if (!rx.test(t)) return;
+    matched.push(name);
+    devScore += points;
+  };
+  const hitNeg = (name, rx, points = 1) => {
+    if (!rx.test(t)) return;
+    matched.push(name);
+    negScore += points;
+  };
+
+  hitJob('hiring', /\b(we'?re hiring|we are hiring|hiring now|now hiring|hiring|hire)\b/i, 3);
+  hitJob('recruiting', /\b(recruiting|recruiter|recruitment|staffing|talent acquisition)\b/i, 2);
+  hitJob('looking_for', /\b(looking for|seeking|in search of|need (a|an)?|need help|want (a|an)?|need someone)\b/i, 2);
+  hitJob('open_roles', /\b(open position|openings|vacancy|role|position|job (opening|opportunity)?)\b/i, 2);
+  hitJob('apply', /\b(apply|application|submit (your )?(cv|resume)|send (your )?(cv|resume)|interview|screening call)\b/i, 1);
+  hitJob('contract_terms', /\b(contract|freelance|part[-\s]?time|full[-\s]?time|remote|hybrid|on[-\s]?site|wfh)\b/i, 1);
+  hitJob('rate_money', /(\$|€|£|₦|₹)\s?\d|(\b(usd|eur|gbp|ngn|inr|cad|aud)\b)\s?\d|\b(budget|rate|salary|compensation|paid)\b/i, 2);
+  hitJob('contact', /\b(dm|pm|reach out|contact|telegram|whatsapp|email|send message)\b/i, 1);
+
+  hitDev('dev_roles', /\b(developer|engineer|programmer|software|swe|frontend|backend|full[\s-]?stack|mobile|ios|android|devops|qa|sdet|tester|data engineer|ml engineer|ai engineer|security engineer|blockchain developer)\b/i, 2);
+  hitDev('tech_stack', /\b(react|next\.?js|vue|nuxt|angular|svelte|node(\.js)?|express|nestjs|django|flask|fastapi|laravel|spring|dotnet|\.net|rails)\b/i, 2);
+  hitDev('languages', /\b(javascript|typescript|python|java|kotlin|swift|golang|go\b|rust|php|c\+\+|c#|solidity|ruby)\b/i, 2);
+  hitDev('infra', /\b(aws|gcp|azure|docker|kubernetes|terraform|ci\/cd|devops)\b/i, 1);
+  hitDev('signals', /\b(github|gitlab|pull request|codebase|api|backend|frontend|database|postgres|mongodb|redis)\b/i, 1);
 
   const roleish =
     /\b(developer|engineer|frontend|backend|full[\s-]?stack|mobile|ios|android|flutter|react|node|python|django|laravel|golang|rust|devops|qa|tester|designer|product designer|ui\/ux|data engineer|ml engineer|ai engineer)\b/i;
   if (roleish.test(t) && /\b(need|looking for|seeking|hiring|recruit)\b/i.test(t)) {
     matched.push('role+need');
-    score += 2;
+    devScore += 1;
+    jobScore += 2;
   }
 
-  const strongSelfPromo =
-    /\b(i'?m|i am|available|open to work|seeking (a )?role|looking for (a )?job|hire me)\b/i;
-  if (strongSelfPromo.test(t) && /\b(my (portfolio|cv|resume)|portfolio:|cv:|resume:)\b/i.test(t)) {
-    matched.push('self_promo');
-    score -= 2;
-  }
+  hitNeg('self_promo', /\b(i'?m|i am|available|open to work|seeking (a )?role|looking for (a )?job|hire me)\b/i, 2);
+  hitNeg('promo_links', /\b(my (portfolio|cv|resume)|portfolio:|cv:|resume:|upwork|fiverr)\b/i, 1);
+  hitNeg('non_dev_spam', /\b(airdrop|signal|forex|betting|casino|loan|crypto pump|giveaway)\b/i, 3);
 
-  return { score, matched: [...new Set(matched)] };
+  score = (devScore * 2) + (jobScore * 3) - (negScore * 3);
+  return { score, devScore, jobScore, negScore, matched: [...new Set(matched)] };
 }
 
 async function maybeSendReviewDumpCandidate(doc) {
@@ -221,12 +394,34 @@ async function maybeSendReviewDumpCandidate(doc) {
     const messageId = Number.isFinite(doc?.messageId) ? doc.messageId : null;
     if (!chatId || messageId == null) return;
 
-    const existing = await AiQueueMessage.findOne({ chatId, messageId }, { _id: 1, text: 1, senderName: 1, senderUsername: 1, senderId: 1, groupId: 1, groupLink: 1, messageLink: 1, reviewSentAt: 1, reviewDecision: 1 }).lean().catch(() => null);
+    const existing = await AiQueueMessage.findOne(
+      { chatId, messageId },
+      {
+        _id: 1,
+        text: 1,
+        senderName: 1,
+        senderUsername: 1,
+        senderId: 1,
+        groupId: 1,
+        groupLink: 1,
+        messageLink: 1,
+        listenerUsername: 1,
+        listenerNumber: 1,
+        reviewSentAt: 1,
+        reviewDecision: 1,
+      }
+    ).lean().catch(() => null);
     if (!existing) return;
     if (existing.reviewDecision) return;
     if (existing.reviewSentAt) return;
 
-    const { score, matched } = scoreJobHeuristics(existing.text || '');
+    const { score, devScore, jobScore, negScore, matched } = scoreJobHeuristics(existing.text || '');
+    const minTotal = Math.max(1, Number(process.env.REVIEW_DUMP_MIN_SCORE || 7));
+    const minDev = Math.max(0, Number(process.env.REVIEW_DUMP_MIN_DEV_SCORE || 2));
+    const minJob = Math.max(0, Number(process.env.REVIEW_DUMP_MIN_JOB_SCORE || 2));
+    if (score < minTotal) return;
+    if (devScore < minDev) return;
+    if (jobScore < minJob) return;
 
     const payload = {
       message: existing.text,
@@ -238,9 +433,14 @@ async function maybeSendReviewDumpCandidate(doc) {
       messageLink: existing.messageLink,
     };
     const post = buildCandidatePost(payload);
+    const listenerLabel = existing.listenerUsername
+      ? `@${existing.listenerUsername.toString().replace(/^@/, '')}`
+      : (existing.listenerNumber ? existing.listenerNumber.toString() : '');
     const header =
       `<b>🧾 Manual review (heuristics)</b>\n` +
+      (listenerLabel ? `<b>listener</b>: <code>${escapeHtml(listenerLabel)}</code>\n` : '') +
       `<b>score</b>: <code>${score}</code>\n` +
+      `<b>dev/job/neg</b>: <code>${devScore}/${jobScore}/${negScore}</code>\n` +
       `<b>matched</b>: <code>${escapeHtml(matched.join(', ') || 'n/a')}</code>\n\n`;
 
     const approveRow = [
@@ -715,6 +915,8 @@ async function enqueueAiMessage(doc) {
 
   const setOnInsert = {
     accountId: doc?.accountId?.toString?.() || null,
+    listenerUsername: doc?.listenerUsername || null,
+    listenerNumber: doc?.listenerNumber || null,
     chatId,
     messageId,
     text: (doc?.text || '').toString(),
@@ -773,6 +975,7 @@ async function processAiBatchOnce() {
   _aiBatcherRunning = true;
   let batchId = null;
   try {
+    startJobDmProcessor();
     await releaseStuckAiBatches();
 
     const batchSize = Math.max(1, Math.min(200, Number(process.env.AI_BATCH_SIZE || 60)));
@@ -846,6 +1049,11 @@ async function processAiBatchOnce() {
             await dbg('post.attempt', { batchId, decidedBy, keep: true, targets: targets.length, sentAny: anySent, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
             //#endregion debug-point listener-missing-messages post.attempt
             if (!anySent) await QueuedPost.create(payload).catch(() => {});
+            if (anySent) {
+              const groupKey = doc.chatId || doc.groupId || '';
+              const dmKey = `jobdm:${groupKey}::${contentHash(doc.text)}`;
+              await enqueueJobDmBlast(out.text, out.reply_markup, dmKey);
+            }
           } else {
             listenerTrace('post.queued', { batchId, decidedBy, keep: true, botPostingEnabled: false, messageId: doc.messageId ?? null, chatId: doc.chatId ?? null });
             //#region debug-point listener-missing-messages post.queued
@@ -1087,6 +1295,8 @@ async function runListener(accountId, flag) {
     const account = await Account.findById(accountId);
     if (!account) { flag.running = false; return; }
     if (!account.session) { flag.running = false; return; }
+    const listenerUsername = account?.username ? account.username.toString() : null;
+    const listenerNumber = account?.number ? account.number.toString() : null;
 
     const client = createClient(account.session, accountId);
     let fatalAuthErr = null;
@@ -1098,8 +1308,8 @@ async function runListener(accountId, flag) {
     const DIALOGS_WARM_MS = Math.max(20_000, Number(process.env.LISTENER_DIALOGS_WARM_MS || 60_000));
     const RECONNECT_IDLE_MS = Math.max(2 * 60_000, Number(process.env.LISTENER_RECONNECT_IDLE_MS || 12 * 60_000));
     const BACKFILL_MS = Math.max(60_000, Number(process.env.LISTENER_BACKFILL_MS || 5 * 60_000));
-    const BACKFILL_CHATS = Math.max(5, Math.min(200, Number(process.env.LISTENER_BACKFILL_CHATS || 30)));
-    const BACKFILL_LIMIT = Math.max(3, Math.min(50, Number(process.env.LISTENER_BACKFILL_LIMIT || 8)));
+    const BACKFILL_CHATS = Math.max(5, Math.min(500, Number(process.env.LISTENER_BACKFILL_CHATS || 80)));
+    const BACKFILL_LIMIT = Math.max(3, Math.min(200, Number(process.env.LISTENER_BACKFILL_LIMIT || 80)));
 
     const markListenerConnected = async () => {
       await Account.updateOne(
@@ -1155,6 +1365,8 @@ async function runListener(accountId, flag) {
 
     const backfillRecentText = async () => {
       try {
+        let scanned = 0;
+        let enqueued = 0;
         const dialogs = await client.getDialogs({ limit: BACKFILL_CHATS }).catch(() => []);
         for (const d of dialogs || []) {
           if (!flag.running || fatalAuthErr) return;
@@ -1167,6 +1379,7 @@ async function runListener(accountId, flag) {
             if (!m || m.out || m.action) continue;
             const txt = (m.message || m.text || '').toString().trim();
             if (!txt) continue;
+            scanned++;
             const rawChatId = (m.chatId || ent?.id)?.toString?.() || null;
             const messageId = Number.isFinite(m?.id) ? m.id : null;
             if (!rawChatId || messageId == null) continue;
@@ -1177,6 +1390,8 @@ async function runListener(accountId, flag) {
             const messageLink = buildMessageLink(null, rawChatId, messageId);
             await enqueueAiMessage({
               accountId: accountId.toString(),
+              listenerUsername,
+              listenerNumber,
               chatId,
               messageId,
               text: txt,
@@ -1185,8 +1400,12 @@ async function runListener(accountId, flag) {
               groupLink,
               messageLink,
             });
+            enqueued++;
             maybeSendReviewDumpCandidate({ chatId, messageId }).catch(() => {});
           }
+        }
+        if (scanned) {
+          console.log(`[ListenerBackfill] accountId=${accountId.toString()} chats=${BACKFILL_CHATS} limit=${BACKFILL_LIMIT} scanned=${scanned} enqCalls=${enqueued}`);
         }
       } catch (err) {
         if (isAuthError(err)) fatalAuthErr = err;
@@ -1261,6 +1480,8 @@ async function runListener(accountId, flag) {
 
             await enqueueAiMessage({
               accountId: accountId.toString(),
+              listenerUsername,
+              listenerNumber,
               chatId,
               messageId,
               text: trimmed,

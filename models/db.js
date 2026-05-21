@@ -228,6 +228,8 @@ export const GroupLink = mongoose.model('GroupLink', groupLinkSchema);
 const aiQueueMessageSchema = new mongoose.Schema(
   {
     accountId: { type: String, default: null, index: true },
+    listenerUsername: { type: String, default: null },
+    listenerNumber: { type: String, default: null },
     chatId: { type: String, default: null, index: true },
     messageId: { type: Number, default: null, index: true },
     text: { type: String, required: true },
@@ -288,6 +290,22 @@ const postDedupeSchema = new mongoose.Schema(
 );
 postDedupeSchema.index({ createdAt: 1 }, { expireAfterSeconds: 90 * 24 * 60 * 60 });
 export const PostDedupe = mongoose.model('PostDedupe', postDedupeSchema);
+
+const jobDmBlastSchema = new mongoose.Schema(
+  {
+    status: { type: String, enum: ['pending', 'processing', 'done'], default: 'pending', index: true },
+    lockedAt: { type: Date, default: null },
+    key: { type: String, required: true, unique: true, index: true },
+    text: { type: String, required: true },
+    replyMarkup: { type: mongoose.Schema.Types.Mixed, default: null },
+    lastUserId: { type: String, default: null, index: true },
+    sent: { type: Number, default: 0 },
+    failed: { type: Number, default: 0 },
+  },
+  { timestamps: true }
+);
+jobDmBlastSchema.index({ createdAt: 1 }, { expireAfterSeconds: 14 * 24 * 60 * 60 });
+export const JobDmBlast = mongoose.model('JobDmBlast', jobDmBlastSchema);
 
 export async function connectDB() {
   mongoose.set('runValidators', true);

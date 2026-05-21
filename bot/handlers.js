@@ -20,6 +20,7 @@ import {
   GroupLink,
   AiQueueMessage,
   PostDedupe,
+  JobDmBlast,
 } from '../models/db.js';
 import { sendCodeWithRetry } from '../helpers/telegram.js';
 import { randomFingerprint } from '../helpers/fingerprint.js';
@@ -27,6 +28,7 @@ import { startJoinWorker, stopJoinWorker, isJoinWorkerRunning, isAnyJoinWorkerRu
 import { startMessageWorker, stopMessageWorker, isMessageWorkerRunning, isAnyMessageWorkerRunning } from '../workers/messageWorker.js';
 import { SEED_KEYWORDS } from '../models/keywords.js';
 import { buildCandidatePost, contentHash } from '../helpers/messenger.js';
+import { createClient } from '../helpers/telegram.js';
 
 export async function isAdmin(userId, username) {
   await ensureAdminCacheLoaded();
@@ -84,6 +86,368 @@ const approvedChatCache = {
   groups: new Set(),
   channels: new Set(),
 };
+
+const manualRepostCache = new Map();
+const manualFetchFloodUntilByAccountId = new Map();
+
+function parseFloodWaitSeconds(err) {
+  const msg = (err?.message || '').toString();
+  const m = msg.match(/wait of\s+(\d+)\s+seconds/i);
+  if (m?.[1]) return Number(m[1]);
+  const m2 = msg.match(/FLOOD_WAIT_(\d+)/i);
+  if (m2?.[1]) return Number(m2[1]);
+  return null;
+}
+
+function getAccountLabel(acc) {
+  const u = acc?.username ? `@${acc.username.toString().replace(/^@/, '')}` : null;
+  const n = acc?.number ? acc.number.toString() : null;
+  return u || n || (acc?._id?.toString?.() || 'account');
+}
+
+function shuffleCopy(arr) {
+  const a = [...(arr || [])];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function putManualRepost(payload) {
+  const key = randomBytes(6).toString('hex');
+  manualRepostCache.set(key, { payload, createdAt: Date.now() });
+  const t = setTimeout(() => manualRepostCache.delete(key), 60 * 60 * 1000);
+  if (t?.unref) t.unref();
+  return key;
+}
+
+function normalizeTgChatIdForDedupe(rawChatId) {
+  const s = rawChatId == null ? '' : rawChatId.toString();
+  if (!s) return null;
+  if (s.startsWith('-100')) return `tg:${s.slice(4)}`;
+  if (s.startsWith('-')) return `tg:${s.slice(1)}`;
+  return s;
+}
+
+function buildMessageLinkFromChat(chat, messageId) {
+  if (!chat || !messageId) return null;
+  const uname = chat?.username ? chat.username.toString().trim().replace(/^@/, '') : '';
+  if (uname) return `https://t.me/${uname}/${messageId}`;
+  const raw = chat?.id?.toString?.() || '';
+  if (!raw.startsWith('-100')) return null;
+  return `https://t.me/c/${raw.slice(4)}/${messageId}`;
+}
+
+function buildGroupLinkFromChat(chat) {
+  if (!chat) return null;
+  const uname = chat?.username ? chat.username.toString().trim().replace(/^@/, '') : '';
+  if (uname) return `https://t.me/${uname}`;
+  return null;
+}
+
+async function enqueueJobDmBlastFromBot(text, replyMarkup, key) {
+  if (!text || !key) return;
+  await JobDmBlast.updateOne(
+    { key },
+    { $setOnInsert: { status: 'pending', lockedAt: null, key, text: text.toString(), replyMarkup: replyMarkup || null, lastUserId: null, sent: 0, failed: 0 } },
+    { upsert: true }
+  ).catch(() => {});
+}
+
+function parseTelegramMessageLink(text = '') {
+  const s = (text || '').toString();
+  const m = s.match(/https?:\/\/t\.me\/([a-zA-Z0-9_]+)\/(\d+)/i);
+  if (m?.[1] && m?.[2] && m[1].toLowerCase() !== 'c') {
+    return { kind: 'username', username: m[1], messageId: Number(m[2]) };
+  }
+  const m2 = s.match(/https?:\/\/t\.me\/c\/(\d+)\/(\d+)/i);
+  if (m2?.[1] && m2?.[2]) {
+    return { kind: 'c', internalId: m2[1], messageId: Number(m2[2]) };
+  }
+  return null;
+}
+
+async function tryFetchMessageFromLink(linkInfo) {
+  const accounts = await Account.find(
+    { session: { $nin: [null, ''] }, role: { $in: ['listener', 'preacher', 'finder', 'inviter'] } },
+    'session role username number'
+  ).sort({ createdAt: 1 }).lean().catch(() => []);
+  if (!accounts.length) return { ok: false, reason: 'No logged-in accounts available to fetch this message.' };
+
+  const nowMs = Date.now();
+  const listeners = shuffleCopy(accounts.filter(a => a.role === 'listener'));
+  const preachers = shuffleCopy(accounts.filter(a => a.role === 'preacher'));
+  const finders = shuffleCopy(accounts.filter(a => a.role === 'finder'));
+  const inviters = shuffleCopy(accounts.filter(a => a.role === 'inviter'));
+  const ordered = [...listeners, ...preachers, ...finders, ...inviters];
+
+  const maxTries = ordered.length;
+  let lastErr = null;
+  const floodSkips = [];
+  const errors = [];
+
+  for (let i = 0; i < maxTries; i++) {
+    const acc = ordered[i];
+    const accId = acc?._id?.toString?.() || '';
+    const floodUntil = accId ? (manualFetchFloodUntilByAccountId.get(accId) || 0) : 0;
+    if (floodUntil && floodUntil > nowMs) {
+      floodSkips.push({ account: getAccountLabel(acc), untilInSec: Math.ceil((floodUntil - nowMs) / 1000) });
+      continue;
+    }
+
+    const client = createClient(acc.session, acc._id);
+    try {
+      await client.connect();
+
+      let peer = null;
+      let groupLink = null;
+      if (linkInfo.kind === 'username') {
+        peer = await client.getEntity(linkInfo.username);
+        groupLink = `https://t.me/${linkInfo.username.replace(/^@/, '')}`;
+      } else if (linkInfo.kind === 'c') {
+        const full = `-100${linkInfo.internalId}`;
+        peer = await client.getEntity(full);
+      } else {
+        await client.disconnect().catch(() => {});
+        return { ok: false, reason: 'Unsupported link format.' };
+      }
+
+      const msgs = await client.getMessages(peer, { ids: [linkInfo.messageId] }).catch(() => []);
+      const m = Array.isArray(msgs) ? msgs[0] : msgs;
+      const txt = (m?.message || m?.text || '').toString().trim();
+      if (!txt) {
+        await client.disconnect().catch(() => {});
+        return { ok: false, reason: 'Message has no text (or is not accessible).' };
+      }
+
+      let senderId = m?.senderId?.toString?.() || null;
+      let senderUsername = null;
+      let senderName = null;
+      try {
+        const sender = await m.getSender().catch(() => null);
+        senderId = sender?.id?.toString?.() || senderId;
+        senderUsername = sender?.username ? `@${sender.username}` : null;
+        senderName = [sender?.firstName, sender?.lastName].filter(Boolean).join(' ') || null;
+      } catch {}
+
+      const entId = peer?.id?.toString?.() || null;
+      const dedupeChatId =
+        linkInfo.kind === 'c'
+          ? `tg:${linkInfo.internalId}`
+          : entId ? `tg:${entId}` : null;
+
+      const messageLink =
+        linkInfo.kind === 'username'
+          ? `https://t.me/${linkInfo.username.replace(/^@/, '')}/${linkInfo.messageId}`
+          : `https://t.me/c/${linkInfo.internalId}/${linkInfo.messageId}`;
+
+      await client.disconnect().catch(() => {});
+
+      return {
+        ok: true,
+        payload: {
+          message: txt,
+          senderName,
+          senderUsername,
+          senderId,
+          groupId: dedupeChatId,
+          groupLink,
+          messageLink,
+          _dedupeChatId: dedupeChatId,
+          _dedupeMessageId: linkInfo.messageId,
+        },
+      };
+    } catch (err) {
+      lastErr = err;
+      const floodSec = parseFloodWaitSeconds(err);
+      if (floodSec && acc?._id) {
+        manualFetchFloodUntilByAccountId.set(acc._id.toString(), Date.now() + floodSec * 1000);
+        floodSkips.push({ account: getAccountLabel(acc), waitSec: floodSec });
+      } else {
+        errors.push({ account: getAccountLabel(acc), error: (err?.message || 'error').toString() });
+      }
+      try { await client.disconnect(); } catch {}
+    }
+  }
+
+  const msg = lastErr?.message ? lastErr.message.toString() : 'fetch_failed';
+  const bits = [];
+  if (floodSkips.length) bits.push(`floodwaited=${floodSkips.length}`);
+  if (errors.length) bits.push(`errors=${errors.length}`);
+  const summary = bits.length ? ` (${bits.join(', ')})` : '';
+  const detail =
+    floodSkips.length
+      ? `\nFlood-waits:\n${floodSkips.slice(0, 8).map(x => `- ${x.account}: ${x.waitSec || x.untilInSec}s`).join('\n')}${floodSkips.length > 8 ? '\n- ...' : ''}`
+      : '';
+  return { ok: false, reason: `Can't fetch this message with available accounts${summary}. (${msg})${detail}` };
+}
+
+async function handleManualForwardRepost(ctx) {
+  try {
+    if (ctx.chat?.type !== 'private' && ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') return false;
+    if (!(await isAdmin(ctx.from?.id, ctx.from?.username))) return false;
+    const msg = ctx.message;
+    if (!msg) return false;
+    const text = (msg.text || msg.caption || '').toString().trim();
+    if (!text) return false;
+
+    const fwdChat = msg.forward_from_chat || msg.forward_origin?.chat || null;
+    const fwdMsgId = msg.forward_from_message_id || msg.forward_origin?.message_id || null;
+    if (!fwdChat || !fwdMsgId) return false;
+
+    const sourceChatId = normalizeTgChatIdForDedupe(fwdChat.id);
+    const sourceMessageId = Number(fwdMsgId) || null;
+    const groupLink = buildGroupLinkFromChat(fwdChat);
+    const messageLink = buildMessageLinkFromChat(fwdChat, sourceMessageId);
+
+    const fwdUser = msg.forward_from || msg.forward_origin?.sender_user || null;
+    const senderId = fwdUser?.id ? fwdUser.id.toString() : null;
+    const senderUsername = fwdUser?.username ? `@${fwdUser.username}` : null;
+    const senderName = [fwdUser?.first_name, fwdUser?.last_name].filter(Boolean).join(' ') || null;
+
+    const payload = {
+      message: text,
+      senderName,
+      senderUsername,
+      senderId,
+      groupId: sourceChatId,
+      groupLink,
+      messageLink,
+      _dedupeChatId: sourceChatId,
+      _dedupeMessageId: sourceMessageId,
+    };
+
+    const out = buildCandidatePost(payload);
+    const key = putManualRepost(payload);
+    await ctx.reply(
+      `<b>Preview</b>\n\n${out.text}`,
+      {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Post to targets', callback_data: `manual_post_${key}` },
+              { text: '⛔ Cancel', callback_data: `manual_cancel_${key}` },
+            ],
+            ...(out.reply_markup?.inline_keyboard || []),
+          ],
+        },
+      }
+    ).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function handleManualPasteLink(ctx) {
+  try {
+    if (ctx.chat?.type !== 'group' && ctx.chat?.type !== 'supergroup') return false;
+    if (!(await isAdmin(ctx.from?.id, ctx.from?.username))) return false;
+    const text = (ctx.message?.text || '').toString();
+    if (!text) return false;
+
+    const linkInfo = parseTelegramMessageLink(text);
+    if (!linkInfo) return false;
+
+    const res = await tryFetchMessageFromLink(linkInfo);
+    if (!res.ok || !res.payload) {
+      await ctx.reply(`Can't create preview for this link.\n\n${res.reason || 'Unknown reason.'}`, { disable_web_page_preview: true }).catch(() => {});
+      return true;
+    }
+
+    const out = buildCandidatePost(res.payload);
+    const key = putManualRepost(res.payload);
+    await ctx.reply(
+      `<b>Preview</b>\n\n${out.text}`,
+      {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Post to targets', callback_data: `manual_post_${key}` },
+              { text: '⛔ Cancel', callback_data: `manual_cancel_${key}` },
+            ],
+            ...(out.reply_markup?.inline_keyboard || []),
+          ],
+        },
+      }
+    ).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function handleManualPost(ctx, key) {
+  if (!(await requireAdmin(ctx))) return;
+  const item = manualRepostCache.get(key);
+  if (!item?.payload) {
+    await ctx.answerCbQuery('Expired');
+    return;
+  }
+  const payload = item.payload;
+  const settings = await getSettings();
+  const targets = await getJobTargetChatIdsForPosting();
+  if (!targets.length) {
+    await ctx.answerCbQuery('No target chats configured');
+    return;
+  }
+
+  if (!settings.botPostingEnabled) {
+    await QueuedPost.create(payload).catch(() => {});
+    await ctx.answerCbQuery('Queued (posting disabled)');
+    return;
+  }
+
+  const out = buildCandidatePost(payload);
+  let anySent = false;
+  for (const target of targets) {
+    const groupKey = payload._dedupeChatId || payload.groupId || '';
+    const txtKey = `txt:${groupKey}::${contentHash(payload.message)}::${target}`;
+    const insertedTxt = await PostDedupe.create({
+      key: txtKey,
+      sourceChatId: payload._dedupeChatId || null,
+      sourceMessageId: payload._dedupeMessageId ?? null,
+      targetChatId: target.toString(),
+    }).then(() => true).catch(() => false);
+    if (!insertedTxt) continue;
+
+    const sentOk = await ctx.telegram.sendMessage(target, out.text, {
+      disable_web_page_preview: true,
+      parse_mode: 'HTML',
+      reply_markup: out.reply_markup || undefined,
+    }).then(() => true).catch((err) => {
+      console.log(`[ManualPost] send_failed ${JSON.stringify({ target: target.toString(), error: err?.message || 'send_failed' })}`);
+      return false;
+    });
+
+    if (sentOk) anySent = true;
+    else await PostDedupe.deleteOne({ key: txtKey }).catch(() => {});
+  }
+
+  await ctx.answerCbQuery(anySent ? '✅ Posted' : 'Failed to post');
+  try {
+    await ctx.editMessageReplyMarkup({
+      inline_keyboard: [[{ text: anySent ? '✅ POSTED' : '❌ FAILED', callback_data: 'ui_noop' }]],
+    });
+  } catch {}
+  if (anySent) {
+    const groupKey = payload._dedupeChatId || payload.groupId || '';
+    const dmKey = `jobdm:${groupKey}::${contentHash(payload.message)}`;
+    await enqueueJobDmBlastFromBot(out.text, out.reply_markup, dmKey);
+  }
+}
+
+async function handleManualCancel(ctx, key) {
+  if (!(await requireAdmin(ctx))) return;
+  manualRepostCache.delete(key);
+  await ctx.answerCbQuery('Cancelled');
+  try { await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: '⛔ CANCELLED', callback_data: 'ui_noop' }]] }); } catch {}
+}
 
 async function refreshApprovedChatCache() {
   const rows = await ApprovedChat.find({}).lean();
@@ -600,8 +964,19 @@ async function authorizedGroupMiddleware(ctx, next) {
   const chatId = chat.id.toString();
   if (approvedChatCache.groups.has(chatId)) return next();
 
+  if (ctx.updateType === 'callback_query') {
+    const data = ctx?.callbackQuery?.data ? ctx.callbackQuery.data.toString() : '';
+    if (/^(review_(ok|no)_.+|manual_(post|cancel)_[0-9a-f]+)$/i.test(data)) return next();
+    return;
+  }
+
   const from = ctx.from;
   const isAdm = from ? await isAdmin(from.id, from.username) : false;
+  if (isAdm) {
+    const s = await getSettings().catch(() => null);
+    const dumpId = s?.reviewDumpChatId ? s.reviewDumpChatId.toString() : null;
+    if (dumpId && dumpId === chatId) return next();
+  }
 
   const rawText = (ctx.message?.text || '').trim();
   const cmd = rawText ? rawText.split(/\s+/)[0].toLowerCase() : null;
@@ -2909,6 +3284,15 @@ async function handleReviewDecision(ctx, queueId, decision) {
     return;
   }
 
+  const logCtx = {
+    queueId: id,
+    decision,
+    by: ctx?.from?.id?.toString?.() || null,
+    chatId: doc?.chatId || null,
+    messageId: doc?.messageId ?? null,
+    listener: doc?.listenerUsername ? `@${doc.listenerUsername}` : (doc?.listenerNumber || null),
+  };
+
   const already = doc.reviewDecision;
   if (already) {
     await ctx.answerCbQuery(`Already ${already}`);
@@ -2922,10 +3306,30 @@ async function handleReviewDecision(ctx, queueId, decision) {
     { $set: { reviewDecision: decision, reviewDecidedBy: ctx.from.id.toString(), reviewDecidedAt: now } }
   ).catch(() => {});
 
+  if (decision === 'declined') {
+    const dumpMessageId = ctx?.callbackQuery?.message?.message_id || null;
+    try {
+      if (dumpMessageId) await ctx.telegram.deleteMessage(ctx.chat.id, dumpMessageId);
+    } catch {}
+    await AiQueueMessage.deleteOne({ _id: doc._id }).catch(() => {});
+    console.log(`[Review] decline.deleted ${JSON.stringify(logCtx)}`);
+    await ctx.answerCbQuery('🗑️ Deleted');
+    return;
+  }
+
   if (decision === 'approved') {
     const settings = await getSettings();
     const targets = await getJobTargetChatIdsForPosting();
-    if (targets.length) {
+    console.log(`[Review] approve.start ${JSON.stringify({ ...logCtx, targets: targets.length, botPostingEnabled: !!settings?.botPostingEnabled })}`);
+
+    if (!targets.length) {
+      await AiQueueMessage.updateOne({ _id: doc._id, reviewDecision: 'approved' }, { $set: { reviewDecision: null } }).catch(() => {});
+      await ctx.answerCbQuery('No target chats configured');
+      console.log(`[Review] approve.no_targets ${JSON.stringify(logCtx)}`);
+      return;
+    }
+
+    {
       const payload = {
         message: doc.text,
         senderName: doc.senderName,
@@ -2938,6 +3342,7 @@ async function handleReviewDecision(ctx, queueId, decision) {
 
       if (settings.botPostingEnabled) {
         const out = buildCandidatePost(payload);
+        let anySent = false;
         for (const target of targets) {
           const groupKey = doc.chatId || doc.groupId || '';
           const txtKey = `txt:${groupKey}::${contentHash(doc.text)}::${target}`;
@@ -2959,14 +3364,36 @@ async function handleReviewDecision(ctx, queueId, decision) {
             }).catch(() => {});
           }
 
-          await ctx.telegram.sendMessage(target, out.text, {
+          const sentOk = await ctx.telegram.sendMessage(target, out.text, {
             disable_web_page_preview: true,
             parse_mode: 'HTML',
             reply_markup: out.reply_markup || undefined,
-          }).catch(() => {});
+          }).then(() => true).catch((err) => {
+            console.log(`[Review] approve.send_failed ${JSON.stringify({ ...logCtx, target: target.toString(), error: err?.message || 'send_failed' })}`);
+            return false;
+          });
+
+          if (sentOk) {
+            anySent = true;
+            console.log(`[Review] approve.sent ${JSON.stringify({ ...logCtx, target: target.toString() })}`);
+          } else {
+            await PostDedupe.deleteOne({ key: txtKey }).catch(() => {});
+            await PostDedupe.deleteOne({ key: srcKey }).catch(() => {});
+          }
         }
+
+        if (!anySent) {
+          await AiQueueMessage.updateOne({ _id: doc._id, reviewDecision: 'approved' }, { $set: { reviewDecision: null } }).catch(() => {});
+          await ctx.answerCbQuery('Failed to post (check bot permissions/target chat)');
+          console.log(`[Review] approve.none_sent ${JSON.stringify(logCtx)}`);
+          return;
+        }
+        const groupKey = doc.chatId || doc.groupId || '';
+        const dmKey = `jobdm:${groupKey}::${contentHash(doc.text)}`;
+        await enqueueJobDmBlastFromBot(out.text, out.reply_markup, dmKey);
       } else {
         await QueuedPost.create(payload).catch(() => {});
+        console.log(`[Review] approve.queued_posting_disabled ${JSON.stringify(logCtx)}`);
       }
     }
   }
@@ -3795,6 +4222,25 @@ async function membershipSweep(telegram) {
 
 export async function handleMessage(ctx) {
   if (ctx.message?.successful_payment) return handleSuccessfulPayment(ctx);
+  if (!getSession(ctx.from?.id)) {
+  const settingsForDump = await getSettings().catch(() => null);
+  const dumpId = settingsForDump?.reviewDumpChatId ? settingsForDump.reviewDumpChatId.toString() : null;
+  const isDumpChat =
+    dumpId &&
+    (ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup') &&
+    ctx.chat?.id?.toString?.() === dumpId;
+
+  if (isDumpChat) {
+    const handledPaste = await handleManualPasteLink(ctx);
+    if (handledPaste) return;
+    const handledFwd = await handleManualForwardRepost(ctx);
+    if (handledFwd) return;
+  }
+
+    const handled = await handleManualForwardRepost(ctx);
+    if (handled) return;
+  }
+
 
   const session = getSession(ctx.from?.id);
   if (!session) return;
@@ -3983,6 +4429,8 @@ export function setupHandlers(bot) {
   bot.action(/^pick_review_dump_(-?\d+)$/, (ctx) => handlePickReviewDump(ctx, ctx.match[1]));
   bot.action(/^review_ok_(.+)$/i, ctx => handleReviewApprove(ctx, ctx.match[1]));
   bot.action(/^review_no_(.+)$/i, ctx => handleReviewDecline(ctx, ctx.match[1]));
+  bot.action(/^manual_post_([0-9a-f]+)$/i, ctx => handleManualPost(ctx, ctx.match[1]));
+  bot.action(/^manual_cancel_([0-9a-f]+)$/i, ctx => handleManualCancel(ctx, ctx.match[1]));
 
   bot.on('chat_member', handleChatMember);
   bot.on('my_chat_member', handleMyChatMember);
