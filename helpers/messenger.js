@@ -92,21 +92,6 @@ function listenerTrace(event, payload) {
   console.log(`[ListenerTrace] ${event}${suffix}`);
 }
 
-const FALLBACK_KEYWORDS = [
-  'hiring', 'hire', 'recruit', 'recruiting',
-  'looking for', 'looking to hire', 'need a', 'need an', 'need someone',
-  'developer', 'dev', 'engineer', 'software engineer', 'frontend', 'backend', 'fullstack',
-  'freelance', 'contract', 'gig', 'project', 'paid', 'budget', 'salary', 'rate',
-  'remote', 'onsite', 'hybrid',
-  'react', 'node', 'nodejs', 'nextjs', 'next.js', 'typescript', 'javascript',
-  'python', 'django', 'flask', 'fastapi',
-  'php', 'laravel',
-  'golang', 'go developer', 'java', 'spring', 'dotnet', '.net',
-  'flutter', 'react native', 'android', 'ios', 'swift', 'kotlin',
-  'designer', 'ui/ux', 'product designer',
-  'web3', 'solidity', 'blockchain',
-];
-
 async function getSettings() {
   const existing = await BotSettings.findOne({});
   if (existing) return existing;
@@ -118,11 +103,6 @@ async function getPromptTemplate() {
   const raw = await readFile(new URL('../prompt.txt', import.meta.url), 'utf8');
   _promptTemplate = raw;
   return _promptTemplate;
-}
-
-function keywordMatchHiringIntent(text = '') {
-  const lower = (text || '').toLowerCase();
-  return FALLBACK_KEYWORDS.some((k) => lower.includes(k));
 }
 
 function parseTrueFalse(raw = '') {
@@ -162,6 +142,110 @@ function contentHash(text) {
   return createHash('sha256').update(normalized).digest('hex');
 }
 
+function getOpenRouterApiKeys() {
+  const keys = [
+    process.env.OPENROUTER_API_KEY_1,
+    process.env.OPENROUTER_API_KEY_2,
+    process.env.OPENROUTER_API_KEY,
+  ]
+    .map((v) => (v ?? '').toString().trim())
+    .filter(Boolean);
+  return [...new Set(keys)];
+}
+
+function isOpenRouterRetryableStatus(status) {
+  if (!Number.isFinite(status)) return true;
+  if (status === 429) return true;
+  if (status >= 500 && status <= 599) return true;
+  if (status === 408) return true;
+  return false;
+}
+
+function isOpenRouterKeyBadStatus(status) {
+  return status === 401 || status === 402 || status === 403;
+}
+
+async function callOpenRouterWithFailover({
+  prompt,
+  model,
+  parse,
+  traceKind,
+}) {
+  const keys = getOpenRouterApiKeys();
+  if (!keys.length) throw new Error('OPENROUTER_API_KEY_1 missing');
+
+  const maxRetriesPerKey = 3;
+  let lastErr = null;
+
+  for (let keyIndex = 0; keyIndex < keys.length; keyIndex++) {
+    const key = keys[keyIndex];
+    for (let attempt = 1; attempt <= maxRetriesPerKey; attempt++) {
+      const startedAt = Date.now();
+      const controller = new AbortController();
+      const timeoutMs = Math.max(6000, Math.min(60000, Number(process.env.OPENROUTER_TIMEOUT_MS || 25000)));
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        listenerTrace('llm.request', { provider: 'openrouter', model, endpoint: '/api/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0, keyIndex, attempt, traceKind });
+        //#region debug-point listener-missing-messages llm.request
+        await dbg('llm.request', { provider: 'openrouter', model, endpoint: '/api/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0, keyIndex, attempt, traceKind });
+        //#endregion debug-point listener-missing-messages llm.request
+
+        const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: 'user', content: prompt }],
+            temperature: 0,
+          }),
+          signal: controller.signal,
+        });
+
+        if (!res.ok) {
+          const status = res.status;
+          const err = new Error(`openrouter_http_${status}`);
+          err.status = status;
+          throw err;
+        }
+
+        const data = await res.json();
+        const out = data?.choices?.[0]?.message?.content ?? '';
+        listenerTrace('llm.response', { provider: 'openrouter', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null, keyIndex, attempt, traceKind, ms: Date.now() - startedAt });
+        //#region debug-point listener-missing-messages llm.response
+        await dbg('llm.response', { provider: 'openrouter', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null, keyIndex, attempt, traceKind, ms: Date.now() - startedAt });
+        //#endregion debug-point listener-missing-messages llm.response
+
+        const parsed = parse(out);
+        if (parsed == null) throw new Error('openrouter_parse');
+        listenerTrace('llm.parsed', { provider: 'openrouter', model, keyIndex, attempt, traceKind, rows: Array.isArray(parsed) ? parsed.length : undefined });
+        //#region debug-point listener-missing-messages llm.parsed
+        await dbg('llm.parsed', { provider: 'openrouter', model, keyIndex, attempt, traceKind, rows: Array.isArray(parsed) ? parsed.length : undefined });
+        //#endregion debug-point listener-missing-messages llm.parsed
+        return parsed;
+      } catch (err) {
+        lastErr = err;
+        const status = err?.status;
+        const retryAfter = err?.parameters?.retry_after;
+        const retryAfterSec = retryAfter ? Number(retryAfter) : null;
+        const keyBad = isOpenRouterKeyBadStatus(status);
+        const retryable = !keyBad && (isOpenRouterRetryableStatus(status) || err?.name === 'AbortError' || err?.message === 'openrouter_parse');
+
+        if (keyBad) break;
+        if (!retryable || attempt >= maxRetriesPerKey) break;
+
+        const backoffMs = retryAfterSec
+          ? Math.min(60000, Math.max(1000, retryAfterSec * 1000))
+          : Math.min(8000, 500 * (2 ** (attempt - 1)) + randInt(0, 350));
+        await sleep(backoffMs);
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+  }
+
+  throw lastErr || new Error('openrouter_failed');
+}
+
 async function callOpenAI(prompt) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error('OPENAI_API_KEY missing');
@@ -184,27 +268,15 @@ async function callOpenAI(prompt) {
 }
 
 async function callOpenRouter(prompt) {
-  const key = process.env.OPENROUTER_API_KEY;
-  if (!key) throw new Error('OPENROUTER_API_KEY missing');
   const model = process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct:free';
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${key}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0,
-    }),
+  const out = await callOpenRouterWithFailover({
+    prompt,
+    model,
+    parse: (raw) => parseTrueFalse(raw),
+    traceKind: 'single',
   });
-  if (!res.ok) throw new Error(`openrouter_http_${res.status}`);
-  const data = await res.json();
-  const out = data?.choices?.[0]?.message?.content ?? '';
-  const parsed = parseTrueFalse(out);
-  if (parsed == null) throw new Error('openrouter_parse');
-  return parsed;
+  if (out == null) throw new Error('openrouter_parse');
+  return out;
 }
 
 function extractJsonFromText(raw = '') {
@@ -273,36 +345,15 @@ async function callOpenAIBatch(prompt) {
 }
 
 async function callOpenRouterBatch(prompt) {
-  const key = process.env.OPENROUTER_API_KEY;
-  if (!key) throw new Error('OPENROUTER_API_KEY missing');
   const model = process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct:free';
-  listenerTrace('llm.request', { provider: 'openrouter', model, endpoint: '/api/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0 });
-  //#region debug-point listener-missing-messages llm.request
-  await dbg('llm.request', { provider: 'openrouter', model, endpoint: '/api/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0 });
-  //#endregion debug-point listener-missing-messages llm.request
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0,
-    }),
+  const out = await callOpenRouterWithFailover({
+    prompt,
+    model,
+    parse: (raw) => parseBatchDecisions(raw),
+    traceKind: 'batch',
   });
-  if (!res.ok) throw new Error(`openrouter_http_${res.status}`);
-  const data = await res.json();
-  const out = data?.choices?.[0]?.message?.content ?? '';
-  listenerTrace('llm.response', { provider: 'openrouter', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null });
-  //#region debug-point listener-missing-messages llm.response
-  await dbg('llm.response', { provider: 'openrouter', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null });
-  //#endregion debug-point listener-missing-messages llm.response
-  const parsed = parseBatchDecisions(out);
-  if (!parsed) throw new Error('openrouter_batch_parse');
-  listenerTrace('llm.parsed', { provider: 'openrouter', rows: parsed.length });
-  //#region debug-point listener-missing-messages llm.parsed
-  await dbg('llm.parsed', { provider: 'openrouter', rows: parsed.length });
-  //#endregion debug-point listener-missing-messages llm.parsed
-  return parsed;
+  if (!out) throw new Error('openrouter_batch_parse');
+  return out;
 }
 
 async function classifyHiringIntentBatch(items) {
@@ -340,7 +391,6 @@ async function classifyHiringIntentBatch(items) {
     promptChars: prompt.length,
   });
   //#endregion debug-point listener-missing-messages ai.batch
-
   try {
     const rows = await callOpenAIBatch(prompt);
     await BotSettings.updateOne({ _id: settings._id }, { $set: { aiConsecutiveFails: 0 } });
@@ -350,7 +400,7 @@ async function classifyHiringIntentBatch(items) {
       const rows = await callOpenRouterBatch(prompt);
       await BotSettings.updateOne({ _id: settings._id }, { $set: { aiConsecutiveFails: 0 } });
       return { decidedBy: 'openrouter', rows };
-    } catch {
+    } catch (err) {
       const updated = await BotSettings.findOneAndUpdate(
         { _id: settings._id },
         { $inc: { aiConsecutiveFails: 1 } },
@@ -363,14 +413,10 @@ async function classifyHiringIntentBatch(items) {
           (Date.now() - new Date(updated.aiCreditsAlertedAt).getTime()) > 6 * 60 * 60 * 1000;
         if (shouldNotify) {
           await BotSettings.updateOne({ _id: settings._id }, { $set: { aiCreditsAlertedAt: new Date() } });
-          await notifyAllAdmins('AI batch classification has failed repeatedly (possible credits exhausted). Falling back to keyword matching.');
+          await notifyAllAdmins('AI batch classification has failed repeatedly (OpenAI + OpenRouter). No keyword fallback is enabled, so job posts are paused until a provider recovers / credits are restored.');
         }
       }
-      listenerTrace('ai.fallback', { decidedBy: 'keyword', itemsCount: items.length });
-      //#region debug-point listener-missing-messages ai.fallback
-      await dbg('ai.fallback', { decidedBy: 'keyword', itemsCount: items.length });
-      //#endregion debug-point listener-missing-messages ai.fallback
-      return { decidedBy: 'keyword', rows: items.map(i => ({ id: i.id, keep: keywordMatchHiringIntent(i.text) })) };
+      throw err;
     }
   }
 }
@@ -384,12 +430,12 @@ async function classifyHiringIntent(text) {
     const ok = await callOpenAI(prompt);
     await BotSettings.updateOne({ _id: settings._id }, { $set: { aiConsecutiveFails: 0 } });
     return ok;
-  } catch {
+  } catch (err) {
     try {
       const ok = await callOpenRouter(prompt);
       await BotSettings.updateOne({ _id: settings._id }, { $set: { aiConsecutiveFails: 0 } });
       return ok;
-    } catch (e2) {
+    } catch (err2) {
       const updated = await BotSettings.findOneAndUpdate(
         { _id: settings._id },
         { $inc: { aiConsecutiveFails: 1 } },
@@ -402,10 +448,10 @@ async function classifyHiringIntent(text) {
           (Date.now() - new Date(updated.aiCreditsAlertedAt).getTime()) > 6 * 60 * 60 * 1000;
         if (shouldNotify) {
           await BotSettings.updateOne({ _id: settings._id }, { $set: { aiCreditsAlertedAt: new Date() } });
-          await notifyAllAdmins('AI classification has failed repeatedly (possible credits exhausted). Falling back to keyword matching.');
+          await notifyAllAdmins('AI classification has failed repeatedly (OpenAI + OpenRouter). No keyword fallback is enabled, so job posts are paused until a provider recovers / credits are restored.');
         }
       }
-      return keywordMatchHiringIntent(text);
+      throw err2;
     }
   }
 }
@@ -571,7 +617,7 @@ async function processAiBatchOnce() {
 
     for (const doc of docs) {
       const id = doc._id.toString();
-      const keep = decisionMap.has(id) ? decisionMap.get(id) : keywordMatchHiringIntent(doc.text);
+      const keep = decisionMap.has(id) ? decisionMap.get(id) : false;
 
       if (keep) {
         if (targets.length) {
