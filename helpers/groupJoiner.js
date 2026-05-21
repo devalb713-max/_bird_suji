@@ -115,6 +115,74 @@ function listenerGroupKey(g) {
   return null;
 }
 
+function workerGroupKey(g) {
+  const link = g?.normalizedLink ? normalizeTmeLink(g.normalizedLink) : g?.link ? normalizeTmeLink(g.link) : '';
+  if (link) return `link:${link}`;
+  const id = g?.id?.toString?.() || '';
+  if (id) return `id:${id}`;
+  return null;
+}
+
+async function resolveEntityForGroup(client, group) {
+  if (!group) return null;
+  const id = group?.id?.toString?.() || '';
+  if (id) {
+    const digits = id.replace(/^-100/, '').replace(/^-/, '');
+    if (/^\d+$/.test(digits)) {
+      const variants = [digits, `-100${digits}`, `-${digits}`];
+      for (const v of variants) {
+        try {
+          const ent = await client.getEntity(v);
+          if (ent) return ent;
+        } catch {}
+        try {
+          const ent = await client.getEntity(BigInt(v));
+          if (ent) return ent;
+        } catch {}
+      }
+    }
+  }
+
+  const uname = extractUsernameFromLink(group?.normalizedLink || group?.link || '');
+  if (uname) {
+    const ent = await client.getEntity(uname).catch(() => null);
+    if (ent) return ent;
+  }
+  return null;
+}
+
+async function leaveEntity(client, entity) {
+  if (!entity) return false;
+  if (entity.className === 'Chat') {
+    await client.invoke(new Api.messages.DeleteChatUser({ chatId: entity.id, userId: new Api.InputUserSelf() }));
+    return true;
+  }
+  await client.invoke(new Api.channels.LeaveChannel({ channel: entity }));
+  return true;
+}
+
+async function leaveWorkerGroup(client, accountId, group) {
+  const entity = await resolveEntityForGroup(client, group);
+  if (!entity) return false;
+  try {
+    await leaveEntity(client, entity);
+  } catch {
+    return false;
+  }
+
+  const ors = [];
+  if (group?.id) ors.push({ id: group.id.toString() });
+  if (group?.normalizedLink) ors.push({ normalizedLink: normalizeTmeLink(group.normalizedLink) });
+  if (group?.link) ors.push({ link: group.link.toString() });
+  if (!ors.length) return true;
+
+  await Account.updateOne(
+    { _id: accountId },
+    { $pull: { groups: { $or: ors } } }
+  ).catch(() => {});
+  return true;
+}
+
 async function leaveListenerGroup(client, accountId, group) {
   let entity = null;
   const id = group?.id?.toString?.() || '';
@@ -841,6 +909,83 @@ export async function enforceUniqueListenerGroupsOnce() {
       }
     } catch {
       try { await client.disconnect(); } catch {}
+    } finally {
+      try { await client.disconnect(); } catch {}
+    }
+  }
+}
+
+export async function enforceUniqueWorkerGroupsOnce() {
+  const maxLeaves = Math.max(1, Math.min(60, Number(process.env.WORKER_GROUP_DEDUPE_MAX_LEAVES || 20)));
+  const { ids: approvedIds, links: approvedLinks } = await getApprovedGroupExemptions();
+  const accounts = await Account.find(
+    { role: { $in: ['listener', 'preacher'] }, session: { $nin: [null, ''] } },
+    { _id: 1, role: 1, createdAt: 1, session: 1, groups: 1, username: 1, number: 1 }
+  ).lean();
+
+  const byKey = new Map();
+  for (const acc of accounts) {
+    for (const g of acc.groups || []) {
+      const key = workerGroupKey(g);
+      if (!key) continue;
+      if (key.startsWith('link:')) {
+        const link = key.slice(5);
+        if (approvedLinks.has(link)) continue;
+      } else if (key.startsWith('id:')) {
+        const id = key.slice(3);
+        if (isApprovedIdMatch(id, approvedIds)) continue;
+      }
+      const list = byKey.get(key) || [];
+      list.push({ acc, g, key });
+      byKey.set(key, list);
+    }
+  }
+
+  const leaves = [];
+  for (const [key, list] of byKey.entries()) {
+    if (list.length <= 1) continue;
+    list.sort((a, b) => {
+      const ra = (a.acc.role || '').toString();
+      const rb = (b.acc.role || '').toString();
+      if (ra !== rb) {
+        if (ra === 'listener') return -1;
+        if (rb === 'listener') return 1;
+      }
+      const ta = a.acc.createdAt ? new Date(a.acc.createdAt).getTime() : 0;
+      const tb = b.acc.createdAt ? new Date(b.acc.createdAt).getTime() : 0;
+      if (ta !== tb) return ta - tb;
+      return a.acc._id.toString().localeCompare(b.acc._id.toString());
+    });
+    const winner = list[0];
+    for (let i = 1; i < list.length; i++) {
+      leaves.push({ winner, loser: list[i] });
+    }
+  }
+
+  let did = 0;
+  const seenLosers = new Set();
+  for (const item of leaves) {
+    if (did >= maxLeaves) break;
+    const loserAcc = item.loser.acc;
+    const loserId = loserAcc._id.toString();
+    const group = item.loser.g;
+    const groupKey = item.loser.key;
+    const perAccountKey = `${loserId}::${groupKey}`;
+    if (seenLosers.has(perAccountKey)) continue;
+    seenLosers.add(perAccountKey);
+
+    const label = loserAcc.username || loserAcc.number || loserId;
+    const client = createClient(loserAcc.session, loserAcc._id);
+    try {
+      await client.connect();
+      const left = await leaveWorkerGroup(client, loserAcc._id, group);
+      if (left) {
+        did++;
+        console.log(`[WorkerDedupe] left role=${loserAcc.role} account=${label} groupKey=${groupKey} winner=${item.winner.acc._id.toString()}`);
+        await sleep(1200 + Math.random() * 1200);
+      }
+    } catch (err) {
+      if (isFloodError(err)) await sleep(getFloodSeconds(err) * 1000);
     } finally {
       try { await client.disconnect(); } catch {}
     }

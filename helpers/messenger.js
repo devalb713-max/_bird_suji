@@ -1674,6 +1674,7 @@ async function runPreacher(accountId, flag) {
     const account = await Account.findById(accountId);
     if (!account) { flag.running = false; return; }
     if (!account.session) { flag.running = false; return; }
+    initGroups(accountId, account.groups || []);
 
     const label = account.username || account.number;
     const client = createClient(account.session, accountId);

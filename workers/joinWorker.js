@@ -1,5 +1,5 @@
 import { Account, Admin, AiQueueMessage, ApprovedChat, BotSettings, GroupLink, InviteTicket, Keyword } from '../models/db.js';
-import { runGroupJoiner, enforceUniqueListenerGroupsOnce, syncListenerAndPreacherGroupsOnce } from '../helpers/groupJoiner.js';
+import { runGroupJoiner, enforceUniqueWorkerGroupsOnce, syncListenerAndPreacherGroupsOnce } from '../helpers/groupJoiner.js';
 import { createClient, sleep, isAuthError } from '../helpers/telegram.js';
 import { Telegram } from 'telegraf';
 
@@ -322,7 +322,7 @@ export function startPoller() {
   if (pollerStarted) return;
   pollerStarted = true;
   const POLL_INTERVAL = 60000;
-  const DEDUPE_INTERVAL = Math.max(60_000, Number(process.env.LISTENER_DEDUPE_INTERVAL_MS || 5 * 60 * 1000));
+  const DEDUPE_INTERVAL = Math.max(1_000, Number(process.env.WORKER_GROUP_DEDUPE_INTERVAL_MS || 1_000));
   const GROUP_SYNC_INTERVAL = Math.max(60_000, Number(process.env.ACCOUNT_GROUPS_SYNC_INTERVAL_MS || 5 * 60 * 1000));
   const SPAMBOT_INTERVAL = Math.max(60_000, Number(process.env.SPAMBOT_CHECK_INTERVAL_MS || 5 * 60 * 1000));
 
@@ -362,7 +362,7 @@ export function startPoller() {
     if (listenerDedupeRunning) return;
     listenerDedupeRunning = true;
     try {
-      await enforceUniqueListenerGroupsOnce();
+      await enforceUniqueWorkerGroupsOnce();
     } catch {}
     listenerDedupeRunning = false;
   }, DEDUPE_INTERVAL);
