@@ -1090,15 +1090,16 @@ async function runListener(accountId, flag) {
 
     const client = createClient(account.session, accountId);
     let fatalAuthErr = null;
-    const queue = [];
-    let processing = false;
     let lastListenerEventAt = Date.now();
     let lastDbSeenAt = 0;
     let lastDialogsWarmAt = 0;
+    let lastBackfillAt = 0;
     const KEEPALIVE_MS = Math.max(20_000, Number(process.env.LISTENER_KEEPALIVE_MS || 60_000));
     const DIALOGS_WARM_MS = Math.max(20_000, Number(process.env.LISTENER_DIALOGS_WARM_MS || 60_000));
     const RECONNECT_IDLE_MS = Math.max(2 * 60_000, Number(process.env.LISTENER_RECONNECT_IDLE_MS || 12 * 60_000));
-    const MAX_QUEUE = Math.max(50, Number(process.env.LISTENER_MAX_QUEUE || 300));
+    const BACKFILL_MS = Math.max(60_000, Number(process.env.LISTENER_BACKFILL_MS || 5 * 60_000));
+    const BACKFILL_CHATS = Math.max(5, Math.min(200, Number(process.env.LISTENER_BACKFILL_CHATS || 30)));
+    const BACKFILL_LIMIT = Math.max(3, Math.min(50, Number(process.env.LISTENER_BACKFILL_LIMIT || 8)));
 
     const markListenerConnected = async () => {
       await Account.updateOne(
@@ -1152,46 +1153,43 @@ async function runListener(accountId, flag) {
       return `https://t.me/c/${s.slice(4)}/${messageId}`;
     };
 
-    const processQueue = async () => {
-      if (processing) return;
-      processing = true;
+    const backfillRecentText = async () => {
       try {
-        while (queue.length && flag.running && !fatalAuthErr) {
-          const message = queue.shift();
-          if (!message) continue;
-          const text = (message.text || message.message || '').trim();
-          if (!text) continue;
+        const dialogs = await client.getDialogs({ limit: BACKFILL_CHATS }).catch(() => []);
+        for (const d of dialogs || []) {
+          if (!flag.running || fatalAuthErr) return;
+          const ent = d?.entity;
+          if (!ent) continue;
+          if (ent?.broadcast) continue;
+          const msgs = await client.getMessages(ent, { limit: BACKFILL_LIMIT }).catch(() => []);
+          for (const m of msgs || []) {
+            if (!flag.running || fatalAuthErr) return;
+            if (!m || m.out || m.action) continue;
+            const txt = (m.message || m.text || '').toString().trim();
+            if (!txt) continue;
+            const rawChatId = (m.chatId || ent?.id)?.toString?.() || null;
+            const messageId = Number.isFinite(m?.id) ? m.id : null;
+            if (!rawChatId || messageId == null) continue;
 
-          const sender = await message.getSender().catch(() => null);
-          const senderName = [sender?.firstName, sender?.lastName].filter(Boolean).join(' ') || null;
-          const senderUsername = sender?.username ? `@${sender.username}` : null;
-          const senderId = sender?.id?.toString?.() || message.senderId?.toString?.() || null;
-          const chat = await message.getChat().catch(() => null);
-          const rawChatId = (message.chatId || chat?.id)?.toString?.() || null;
-          const messageId = Number.isFinite(message.id) ? message.id : null;
-          const groupLink = buildGroupLink(chat, rawChatId);
-          const messageLink = buildMessageLink(chat, rawChatId, messageId);
-
-          const chatId = normalizeMessageChatId(rawChatId);
-          const groupId = extractGroupIdFromChatId(rawChatId);
-          await enqueueAiMessage({
-            accountId: accountId.toString(),
-            chatId,
-            messageId,
-            text,
-            senderName,
-            senderUsername,
-            senderId,
-            groupId,
-            groupLink,
-            messageLink,
-          });
-          maybeSendReviewDumpCandidate({ chatId, messageId }).catch(() => {});
+            const chatId = normalizeMessageChatId(rawChatId);
+            const groupId = extractGroupIdFromChatId(rawChatId);
+            const groupLink = getBestKnownGroupJoinLink(rawChatId);
+            const messageLink = buildMessageLink(null, rawChatId, messageId);
+            await enqueueAiMessage({
+              accountId: accountId.toString(),
+              chatId,
+              messageId,
+              text: txt,
+              senderId: m.senderId?.toString?.() || null,
+              groupId,
+              groupLink,
+              messageLink,
+            });
+            maybeSendReviewDumpCandidate({ chatId, messageId }).catch(() => {});
+          }
         }
       } catch (err) {
         if (isAuthError(err)) fatalAuthErr = err;
-      } finally {
-        processing = false;
       }
     };
 
@@ -1214,7 +1212,11 @@ async function runListener(accountId, flag) {
         async (event) => {
           try {
             const message = event?.message;
-            const chatId = (message?.chatId || (await message?.getChat?.().catch(() => null))?.id)?.toString?.() || null;
+            let rawChatId = message?.chatId?.toString?.() || null;
+            if (!rawChatId) {
+              const c = await message?.getChat?.().catch(() => null);
+              rawChatId = c?.id?.toString?.() || null;
+            }
             const messageId = Number.isFinite(message?.id) ? message.id : null;
             const text = (message?.text || message?.message || '').toString();
             const isGroup = !!event?.isGroup;
@@ -1247,13 +1249,28 @@ async function runListener(accountId, flag) {
             //#endregion debug-point listener-missing-messages listener.new_message
 
             if (dropReason) return;
-            if (queue.length >= MAX_QUEUE) {
-              const over = queue.length - MAX_QUEUE + 1;
-              if (over > 0) queue.splice(0, over);
-            }
-            queue.push(message);
-            markListenerSeen({ chatId: normalizeMessageChatId(chatId), messageId }).catch(() => {});
-            processQueue().catch(() => {});
+            if (!rawChatId || messageId == null) return;
+
+            const trimmed = text.trim();
+            if (!trimmed) return;
+
+            const chatId = normalizeMessageChatId(rawChatId);
+            const groupId = extractGroupIdFromChatId(rawChatId);
+            const groupLink = getBestKnownGroupJoinLink(rawChatId);
+            const messageLink = buildMessageLink(null, rawChatId, messageId);
+
+            await enqueueAiMessage({
+              accountId: accountId.toString(),
+              chatId,
+              messageId,
+              text: trimmed,
+              senderId: message?.senderId?.toString?.() || null,
+              groupId,
+              groupLink,
+              messageLink,
+            });
+            maybeSendReviewDumpCandidate({ chatId, messageId }).catch(() => {});
+            markListenerSeen({ chatId, messageId }).catch(() => {});
           } catch {}
         },
         new NewMessage({ incoming: true })
@@ -1263,7 +1280,7 @@ async function runListener(accountId, flag) {
         const idleMs = Date.now() - lastListenerEventAt;
         if (idleMs >= 120000) {
           //#region debug-point listener-missing-messages listener.idle
-          await dbg('listener.idle', { accountId: accountId.toString(), idleMs, queue: queue.length });
+          await dbg('listener.idle', { accountId: accountId.toString(), idleMs });
           //#endregion debug-point listener-missing-messages listener.idle
         }
         try {
@@ -1273,6 +1290,10 @@ async function runListener(accountId, flag) {
           if (Date.now() - lastDialogsWarmAt >= DIALOGS_WARM_MS) {
             lastDialogsWarmAt = Date.now();
             await client.getDialogs({ limit: 120 }).catch(() => {});
+          }
+          if (Date.now() - lastBackfillAt >= BACKFILL_MS) {
+            lastBackfillAt = Date.now();
+            await backfillRecentText();
           }
           if (idleMs >= RECONNECT_IDLE_MS) {
             try { await client.disconnect(); } catch {}
@@ -1285,6 +1306,7 @@ async function runListener(accountId, flag) {
             await markListenerConnected();
             lastListenerEventAt = Date.now();
             lastDialogsWarmAt = Date.now();
+            lastBackfillAt = 0;
           }
         } catch (err) {
           if (isAuthError(err)) fatalAuthErr = err;
