@@ -92,6 +92,11 @@ function listenerTrace(event, payload) {
   console.log(`[ListenerTrace] ${event}${suffix}`);
 }
 
+function llmLog(event, payload) {
+  const suffix = payload === undefined ? '' : ` ${safeTraceStringify(payload)}`;
+  console.log(`[LLM] ${event}${suffix}`);
+}
+
 async function getSettings() {
   const existing = await BotSettings.findOne({});
   if (existing) return existing;
@@ -127,6 +132,36 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
+}
+
+function escapeRegex(value) {
+  return (value ?? '').toString().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildNameTokens({ username, firstName, lastName, fallbackUsername }) {
+  const items = [
+    username,
+    fallbackUsername,
+    firstName,
+    lastName,
+    [firstName, lastName].filter(Boolean).join(' '),
+  ]
+    .map((v) => (v ?? '').toString().trim().replace(/^@/, ''))
+    .filter(Boolean);
+  const uniq = [...new Set(items)];
+  return uniq.filter((t) => t.length >= 4 || /[_\d]/.test(t));
+}
+
+function compileMentionRegexes(tokens) {
+  const out = [];
+  for (const token of tokens) {
+    const allowAt = token && !token.includes(' ') && /[_\d]/.test(token);
+    const pattern = token.includes(' ')
+      ? token.split(/\s+/).map(escapeRegex).join('\\s+')
+      : escapeRegex(token);
+    out.push(new RegExp(`(^|\\W)${allowAt ? '@?' : ''}${pattern}(\\W|$)`, 'i'));
+  }
+  return out;
 }
 
 function normalizeForContentDedupe(text) {
@@ -182,9 +217,10 @@ async function callOpenRouterWithFailover({
     for (let attempt = 1; attempt <= maxRetriesPerKey; attempt++) {
       const startedAt = Date.now();
       const controller = new AbortController();
-      const timeoutMs = Math.max(6000, Math.min(60000, Number(process.env.OPENROUTER_TIMEOUT_MS || 25000)));
+      const timeoutMs = Math.max(6000, Math.min(3600000, Number(process.env.OPENROUTER_TIMEOUT_MS || 3000000)));
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
       try {
+        llmLog('request', { provider: 'openrouter', model, endpoint: '/api/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0, keyIndex, attempt, traceKind });
         listenerTrace('llm.request', { provider: 'openrouter', model, endpoint: '/api/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0, keyIndex, attempt, traceKind });
         //#region debug-point listener-missing-messages llm.request
         await dbg('llm.request', { provider: 'openrouter', model, endpoint: '/api/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0, keyIndex, attempt, traceKind });
@@ -203,6 +239,8 @@ async function callOpenRouterWithFailover({
 
         if (!res.ok) {
           const status = res.status;
+          const body = await res.text().catch(() => '');
+          llmLog('error', { provider: 'openrouter', model, status, bodyPreview: truncateTraceText(body, 900), keyIndex, attempt, traceKind });
           const err = new Error(`openrouter_http_${status}`);
           err.status = status;
           throw err;
@@ -210,6 +248,7 @@ async function callOpenRouterWithFailover({
 
         const data = await res.json();
         const out = data?.choices?.[0]?.message?.content ?? '';
+        llmLog('response', { provider: 'openrouter', model, finish: data?.choices?.[0]?.finish_reason ?? null, contentPreview: truncateTraceText(out, 900), keyIndex, attempt, traceKind });
         listenerTrace('llm.response', { provider: 'openrouter', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null, keyIndex, attempt, traceKind, ms: Date.now() - startedAt });
         //#region debug-point listener-missing-messages llm.response
         await dbg('llm.response', { provider: 'openrouter', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null, keyIndex, attempt, traceKind, ms: Date.now() - startedAt });
@@ -217,6 +256,7 @@ async function callOpenRouterWithFailover({
 
         const parsed = parse(out);
         if (parsed == null) throw new Error('openrouter_parse');
+        llmLog('parsed', { provider: 'openrouter', model, parsedRows: Array.isArray(parsed) ? parsed.length : undefined, parsed, keyIndex, attempt, traceKind });
         listenerTrace('llm.parsed', { provider: 'openrouter', model, keyIndex, attempt, traceKind, rows: Array.isArray(parsed) ? parsed.length : undefined });
         //#region debug-point listener-missing-messages llm.parsed
         await dbg('llm.parsed', { provider: 'openrouter', model, keyIndex, attempt, traceKind, rows: Array.isArray(parsed) ? parsed.length : undefined });
@@ -230,6 +270,7 @@ async function callOpenRouterWithFailover({
         const keyBad = isOpenRouterKeyBadStatus(status);
         const retryable = !keyBad && (isOpenRouterRetryableStatus(status) || err?.name === 'AbortError' || err?.message === 'openrouter_parse');
 
+        llmLog('attempt_failed', { provider: 'openrouter', model, keyIndex, attempt, traceKind, error: err?.message || 'openrouter_failed', status: status ?? null, keyBad, retryable });
         if (keyBad) break;
         if (!retryable || attempt >= maxRetriesPerKey) break;
 
@@ -250,6 +291,7 @@ async function callOpenAI(prompt) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error('OPENAI_API_KEY missing');
   const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  llmLog('request', { provider: 'openai', model, endpoint: '/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0 });
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
@@ -259,10 +301,15 @@ async function callOpenAI(prompt) {
       temperature: 0,
     }),
   });
-  if (!res.ok) throw new Error(`openai_http_${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    llmLog('error', { provider: 'openai', model, status: res.status, bodyPreview: truncateTraceText(body, 900) });
+    throw new Error(`openai_http_${res.status}`);
+  }
   const data = await res.json();
   const out = data?.choices?.[0]?.message?.content ?? '';
   const parsed = parseTrueFalse(out);
+  llmLog('response', { provider: 'openai', model, finish: data?.choices?.[0]?.finish_reason ?? null, contentPreview: truncateTraceText(out, 900), parsed });
   if (parsed == null) throw new Error('openai_parse');
   return parsed;
 }
@@ -319,6 +366,7 @@ async function callOpenAIBatch(prompt) {
   //#region debug-point listener-missing-messages llm.request
   await dbg('llm.request', { provider: 'openai', model, endpoint: '/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0 });
   //#endregion debug-point listener-missing-messages llm.request
+  llmLog('request', { provider: 'openai', model, endpoint: '/v1/chat/completions', temperature: 0, promptChars: prompt?.length ?? 0, traceKind: 'batch' });
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
@@ -328,7 +376,11 @@ async function callOpenAIBatch(prompt) {
       temperature: 0,
     }),
   });
-  if (!res.ok) throw new Error(`openai_http_${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    llmLog('error', { provider: 'openai', model, status: res.status, bodyPreview: truncateTraceText(body, 900), traceKind: 'batch' });
+    throw new Error(`openai_http_${res.status}`);
+  }
   const data = await res.json();
   const out = data?.choices?.[0]?.message?.content ?? '';
   listenerTrace('llm.response', { provider: 'openai', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null });
@@ -336,6 +388,7 @@ async function callOpenAIBatch(prompt) {
   await dbg('llm.response', { provider: 'openai', model, contentPreview: truncateTraceText(out, 1200), finish: data?.choices?.[0]?.finish_reason ?? null });
   //#endregion debug-point listener-missing-messages llm.response
   const parsed = parseBatchDecisions(out);
+  llmLog('response', { provider: 'openai', model, finish: data?.choices?.[0]?.finish_reason ?? null, contentPreview: truncateTraceText(out, 900), parsedRows: parsed?.length ?? 0, traceKind: 'batch' });
   if (!parsed) throw new Error('openai_batch_parse');
   listenerTrace('llm.parsed', { provider: 'openai', rows: parsed.length });
   //#region debug-point listener-missing-messages llm.parsed
@@ -394,13 +447,17 @@ async function classifyHiringIntentBatch(items) {
   try {
     const rows = await callOpenAIBatch(prompt);
     await BotSettings.updateOne({ _id: settings._id }, { $set: { aiConsecutiveFails: 0 } });
+    llmLog('batch.decided', { decidedBy: 'openai', rows: rows.length, kept: rows.filter(r => r.keep).length });
     return { decidedBy: 'openai', rows };
-  } catch {
+  } catch (e1) {
+    llmLog('batch.provider_failed', { provider: 'openai', error: e1?.message || 'openai_failed' });
     try {
       const rows = await callOpenRouterBatch(prompt);
       await BotSettings.updateOne({ _id: settings._id }, { $set: { aiConsecutiveFails: 0 } });
+      llmLog('batch.decided', { decidedBy: 'openrouter', rows: rows.length, kept: rows.filter(r => r.keep).length });
       return { decidedBy: 'openrouter', rows };
     } catch (err) {
+      llmLog('batch.provider_failed', { provider: 'openrouter', error: err?.message || 'openrouter_failed' });
       const updated = await BotSettings.findOneAndUpdate(
         { _id: settings._id },
         { $inc: { aiConsecutiveFails: 1 } },
@@ -1241,6 +1298,8 @@ async function runPreacher(accountId, flag) {
   await dbg('preacher.start', { accountId: accountId.toString(), groupsInDb: (seed?.groups || []).length });
   //#endregion debug-point listener-missing-messages preacher.start
 
+  const joinWatch = new Map();
+
   while (flag.running) {
     const account = await Account.findById(accountId);
     if (!account) { flag.running = false; return; }
@@ -1261,6 +1320,65 @@ async function runPreacher(accountId, flag) {
       await prunePreacherOverlaps(client, accountId);
 
       const logo = await ensureLogoBytes();
+
+      const myUsername = me?.username ? me.username.toString().trim().replace(/^@/, '') : '';
+      const myFirst = me?.firstName ? me.firstName.toString().trim() : '';
+      const myLast = me?.lastName ? me.lastName.toString().trim() : '';
+      const myId = me?.id?.toString?.() || '';
+      const tokens = buildNameTokens({
+        username: myUsername,
+        firstName: myFirst,
+        lastName: myLast,
+        fallbackUsername: account?.username || '',
+      });
+      const mentionRegexes = compileMentionRegexes(tokens);
+      const handler = async (event) => {
+        try {
+          if (!joinWatch.size) return;
+          const message = event?.message;
+          if (!message || message.out) return;
+          const chat = await message.getChat().catch(() => null);
+          const rawChatId = (message.chatId || chat?.id)?.toString?.() || null;
+          if (!rawChatId) return;
+          const internal = rawChatId.startsWith('-100') ? rawChatId.slice(4) : rawChatId.startsWith('-') ? rawChatId.slice(1) : rawChatId;
+          const rec = joinWatch.get(internal);
+          if (!rec) return;
+          if (Date.now() > rec.expiresAt) { joinWatch.delete(internal); return; }
+          if (rec.notified) return;
+
+          const entities = message?.entities || [];
+          const mentionedByEntity = !!(myId && entities.some((e) => {
+            const uid = e?.userId ?? e?.user_id;
+            if (!uid) return false;
+            return uid.toString?.() === myId;
+          }));
+
+          const text = (message.text || message.message || '').toString();
+          const mentionedByText = !!(text && mentionRegexes.some((rx) => rx.test(text)));
+          if (!mentionedByEntity && !mentionedByText) return;
+
+          rec.notified = true;
+          joinWatch.delete(internal);
+
+          const uname = chat?.username ? chat.username.toString().trim().replace(/^@/, '') : '';
+          const groupLink = uname ? `https://t.me/${uname}` : rec.groupLink || null;
+          const messageId = Number.isFinite(message?.id) ? message.id : null;
+          const messageLink = messageId
+            ? (uname ? `https://t.me/${uname}/${messageId}` : rawChatId.startsWith('-100') ? `https://t.me/c/${rawChatId.slice(4)}/${messageId}` : null)
+            : null;
+
+          const header =
+            `🚨 Join verification message detected\n\n` +
+            `accountId: ${accountId.toString()}\n` +
+            `preacher: ${myUsername ? `@${myUsername}` : (account.username ? `@${account.username}` : account.number)}\n` +
+            `group: ${rec.groupTitle || chat?.title || internal}\n` +
+            `groupLink: ${groupLink || 'n/a'}\n` +
+            `messageLink: ${messageLink || 'n/a'}\n\n`;
+          await notifyAllAdmins(`${header}${text}`);
+        } catch {}
+      };
+
+      client.addEventHandler(handler, new NewMessage({}));
 
       while (flag.running) {
         const rotation = await getTemplateRotation(accountId);
@@ -1438,6 +1556,16 @@ async function runPreacher(accountId, flag) {
           joinedThisPhase++;
           takenLinks.add(link);
 
+          if (mentionRx && resolvedEntity?.id) {
+            const internal = resolvedEntity.id.toString();
+            joinWatch.set(internal, {
+              expiresAt: Date.now() + Math.max(60_000, Number(process.env.PREACHER_JOIN_WATCH_MS || 2 * 60 * 1000)),
+              groupLink: link,
+              groupTitle: resolvedEntity?.title || link,
+              notified: false,
+            });
+          }
+
           await sleep(15000 + Math.random() * 20000);
         }
 
@@ -1445,6 +1573,7 @@ async function runPreacher(accountId, flag) {
         await sleep(60000);
       }
 
+      try { client.removeEventHandler(handler); } catch {}
       await client.disconnect();
 
     } catch (err) {

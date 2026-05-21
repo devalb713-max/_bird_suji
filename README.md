@@ -57,9 +57,12 @@ Environment variables (see `.env.example`):
   - `LISTENER_RECONNECT_IDLE_MS` (default 12m)
 - AI classification (optional)
   - `OPENAI_API_KEY`, `OPENAI_MODEL` (default `gpt-4o-mini`)
-  - `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` (default `meta-llama/llama-3.1-8b-instruct:free`)
+  - `OPENROUTER_API_KEY_1`, `OPENROUTER_API_KEY_2` (failover keys), `OPENROUTER_MODEL` (default `meta-llama/llama-3.1-8b-instruct:free`)
+  - `OPENROUTER_TIMEOUT_MS` (default 25000)
 
-The LLM prompt is stored in `prompt.txt` and must return `true` or `false`.
+AI prompt rules are stored in `prompt.txt`.
+- Single-message classifier returns `true`/`false`.
+- Batch classifier returns JSON: `[{ "id": "...", "keep": true|false }]`.
 
 Run:
 

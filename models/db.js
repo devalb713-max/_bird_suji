@@ -35,6 +35,13 @@ const accountSchema = new mongoose.Schema(
     listenerLastChatId: { type: String, default: null },
     listenerLastMessageId: { type: Number, default: null },
     listenerLastError: { type: String, default: null },
+    spamBotLastCheckedAt: { type: Date, default: null },
+    spamBotLastStatus: { type: String, default: null },
+    spamBotLastText: { type: String, default: null },
+    spamBotJailedAt: { type: Date, default: null },
+    spamBotLeaseId: { type: String, default: null },
+    spamBotLeaseExpiresAt: { type: Date, default: null },
+    spamBotLeaseUpdatedAt: { type: Date, default: null },
   },
   { timestamps: true }
 );

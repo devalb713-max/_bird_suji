@@ -132,6 +132,31 @@ In `bot/handlers.js`:
 - State stored in `BotSettings`:
   - `listenerGroupsAnnouncedCount`, `listenerGroupsAnnouncedAt`
 
+## AI Hiring-Intent Classification (OpenAI → OpenRouter)
+
+The listener pipeline only posts messages that pass an LLM-based “hiring intent” classifier.
+
+Where it runs:
+- File: `helpers/messenger.js`
+- Functions: `classifyHiringIntentBatch(...)` and `processAiBatchOnce()`
+
+Provider order + behavior:
+- OpenAI is attempted first.
+- If OpenAI fails, OpenRouter is attempted as fallback.
+- If both providers fail, there is no keyword/regex fallback. The batch errors out, `aiConsecutiveFails` increments, and admins get alerted after repeated failures.
+
+OpenRouter retries + failover:
+- Uses `OPENROUTER_API_KEY_1` then `OPENROUTER_API_KEY_2` (legacy `OPENROUTER_API_KEY` is also accepted).
+- Per key: up to 3 retries (for 429/5xx/timeouts/parse errors), then it rotates to the next key.
+- Config: `OPENROUTER_TIMEOUT_MS` (default 25000).
+
+Safety default:
+- If the model response does not include a decision for a queued message id, it defaults to `keep=false` (do not post).
+
+Admin alerting:
+- Stored in `BotSettings`: `aiConsecutiveFails`, `aiCreditsAlertedAt`, `aiAlertsEnabled`.
+- After repeated failures, admins are notified that providers are failing / credits may be exhausted.
+
 ## Debugging Checklist
 
 1) Are listener accounts receiving any events?
@@ -156,4 +181,3 @@ In `bot/handlers.js`:
 - `workers/joinWorker.js`: join worker + pollers (search-limit resume, dedupe, group sync)
 - `bot/handlers.js`: bot UI (Authorized Groups/Channels), settings, announcements, membership enforcement
 - `dedupe-cross-role-groups.js`: one-time overlap cleanup script (prints JSON evidence)
-

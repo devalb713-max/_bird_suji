@@ -2069,17 +2069,37 @@ export async function handleDeleteAdmin(ctx, adminId) {
 }
 
 export async function handleAccounts(ctx) {
-  const accounts = await Account.find({}).sort({ createdAt: 1 });
-  if (!accounts.length) {
+  const PAGE_SIZE = 10;
+  const match = ctx?.match?.[1] ? Number(ctx.match[1]) : 0;
+  const page = Number.isFinite(match) && match >= 0 ? match : 0;
+
+  const total = await Account.countDocuments();
+  if (!total) {
     await safeEditMessageText(ctx, 'No accounts yet. Add an account from the main menu to begin.', backToMain());
     return ctx.answerCbQuery();
   }
+
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const safePage = Math.min(page, pages - 1);
+
+  const accounts = await Account.find({})
+    .sort({ createdAt: 1 })
+    .skip(safePage * PAGE_SIZE)
+    .limit(PAGE_SIZE);
+
   const buttons = accounts.map((acc, i) => {
-    const label = `${i + 1}. ${acc.username ? '@' + acc.username : acc.number} (${acc.role})`;
+    const idx = safePage * PAGE_SIZE + i + 1;
+    const label = `${idx}. ${acc.username ? '@' + acc.username : acc.number} (${acc.role})`;
     return [Markup.button.callback(label, `acc_${acc._id}`)];
   });
+
+  const nav = [];
+  if (safePage > 0) nav.push(Markup.button.callback('‹ Prev', `accounts_page_${safePage - 1}`));
+  if (safePage < pages - 1) nav.push(Markup.button.callback('Next ›', `accounts_page_${safePage + 1}`));
+  if (nav.length) buttons.push(nav);
   buttons.push([Markup.button.callback('« Back', 'back_to_main')]);
-  await safeEditMessageText(ctx, '📋 *Accounts*\n\nSelect an account below to manage it:', { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+
+  await safeEditMessageText(ctx, `📋 *Accounts* (${total})\n\nSelect an account below to manage it:`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
   await ctx.answerCbQuery();
 }
 
@@ -3701,6 +3721,7 @@ export function setupHandlers(bot) {
   bot.action(/^subscribe_cards_cancel_(.+)$/i, handleSubscribeWithSujicardsCancel);
 
   bot.action('accounts', handleAccounts);
+  bot.action(/^accounts_page_(\d+)$/, handleAccounts);
   bot.action('add_account', handleAddAccount);
   bot.action('pick_role_listener', (ctx) => handlePickAccountRole(ctx, 'listener'));
   bot.action('pick_role_preacher', (ctx) => handlePickAccountRole(ctx, 'preacher'));
