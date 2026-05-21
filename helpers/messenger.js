@@ -164,6 +164,115 @@ function compileMentionRegexes(tokens) {
   return out;
 }
 
+function canonicalInternalChatId(value) {
+  const s = (value ?? '').toString();
+  if (!s) return null;
+  if (s.startsWith('-100')) return s.slice(4);
+  if (s.startsWith('-')) return s.slice(1);
+  return s;
+}
+
+function scoreJobHeuristics(textRaw = '') {
+  const text = (textRaw || '').toString();
+  const t = text.toLowerCase();
+  const matched = [];
+  let score = 0;
+
+  const hit = (name, rx, points = 1) => {
+    if (!rx.test(t)) return;
+    matched.push(name);
+    score += points;
+  };
+
+  hit('hiring', /\b(we'?re hiring|we are hiring|hiring now|now hiring|hiring|hire)\b/i, 3);
+  hit('recruiting', /\b(recruiting|recruiter|recruitment|staffing|talent acquisition)\b/i, 2);
+  hit('looking_for', /\b(looking for|seeking|in search of|need (a|an)|want (a|an))\b/i, 2);
+  hit('open_roles', /\b(open position|openings|vacancy|role|position|job (opening|opportunity)?)\b/i, 2);
+  hit('apply', /\b(apply|application|submit (your )?(cv|resume)|send (your )?(cv|resume)|interview)\b/i, 1);
+  hit('contract_terms', /\b(contract|freelance|part[-\s]?time|full[-\s]?time|remote|hybrid|on[-\s]?site|wfh)\b/i, 1);
+  hit('stack_signal', /\b(tech stack|stack|requirements|responsibilities|experience|years? of experience)\b/i, 1);
+  hit('rate_money', /(\$|€|£|₦|₹)\s?\d|(\b(usd|eur|gbp|ngn|inr|cad|aud)\b)\s?\d|\b(budget|rate|salary|compensation|paid)\b/i, 2);
+  hit('contact', /\b(dm|pm|reach out|contact me|telegram me|send message)\b/i, 1);
+
+  const roleish =
+    /\b(developer|engineer|frontend|backend|full[\s-]?stack|mobile|ios|android|flutter|react|node|python|django|laravel|golang|rust|devops|qa|tester|designer|product designer|ui\/ux|data engineer|ml engineer|ai engineer)\b/i;
+  if (roleish.test(t) && /\b(need|looking for|seeking|hiring|recruit)\b/i.test(t)) {
+    matched.push('role+need');
+    score += 2;
+  }
+
+  const strongSelfPromo =
+    /\b(i'?m|i am|available|open to work|seeking (a )?role|looking for (a )?job|hire me)\b/i;
+  if (strongSelfPromo.test(t) && /\b(my (portfolio|cv|resume)|portfolio:|cv:|resume:)\b/i.test(t)) {
+    matched.push('self_promo');
+    score -= 2;
+  }
+
+  return { score, matched: [...new Set(matched)] };
+}
+
+async function maybeSendReviewDumpCandidate(doc) {
+  try {
+    const settings = await getSettings();
+    const dumpChatId = settings?.reviewDumpChatId ? settings.reviewDumpChatId.toString() : null;
+    if (!dumpChatId) return;
+
+    const chatId = doc?.chatId?.toString?.() || null;
+    const messageId = Number.isFinite(doc?.messageId) ? doc.messageId : null;
+    if (!chatId || messageId == null) return;
+
+    const existing = await AiQueueMessage.findOne({ chatId, messageId }, { _id: 1, text: 1, senderName: 1, senderUsername: 1, senderId: 1, groupId: 1, groupLink: 1, messageLink: 1, reviewSentAt: 1, reviewDecision: 1 }).lean().catch(() => null);
+    if (!existing) return;
+    if (existing.reviewDecision) return;
+    if (existing.reviewSentAt) return;
+
+    const { score, matched } = scoreJobHeuristics(existing.text || '');
+
+    const payload = {
+      message: existing.text,
+      senderName: existing.senderName,
+      senderUsername: existing.senderUsername,
+      senderId: existing.senderId,
+      groupId: existing.groupId || null,
+      groupLink: existing.groupLink,
+      messageLink: existing.messageLink,
+    };
+    const post = buildCandidatePost(payload);
+    const header =
+      `<b>🧾 Manual review (heuristics)</b>\n` +
+      `<b>score</b>: <code>${score}</code>\n` +
+      `<b>matched</b>: <code>${escapeHtml(matched.join(', ') || 'n/a')}</code>\n\n`;
+
+    const approveRow = [
+      { text: '✅ Approve', callback_data: `review_ok_${existing._id}` },
+      { text: '⛔ Decline', callback_data: `review_no_${existing._id}` },
+    ];
+    const extraRows = Array.isArray(post?.reply_markup?.inline_keyboard) ? post.reply_markup.inline_keyboard : [];
+    const reply_markup = { inline_keyboard: [approveRow, ...extraRows] };
+
+    const sent = await botTelegram.sendMessage(dumpChatId, `${header}${post.text}`, {
+      disable_web_page_preview: true,
+      parse_mode: 'HTML',
+      reply_markup,
+    }).catch(() => null);
+
+    if (sent?.message_id) {
+      await AiQueueMessage.updateOne(
+        { _id: existing._id, reviewSentAt: null },
+        {
+          $set: {
+            reviewScore: score,
+            reviewMatched: matched,
+            reviewSentAt: new Date(),
+            reviewDumpChatId: dumpChatId,
+            reviewDumpMessageId: sent.message_id,
+          },
+        }
+      ).catch(() => {});
+    }
+  } catch {}
+}
+
 function normalizeForContentDedupe(text) {
   return (text ?? '')
     .toString()
@@ -172,7 +281,7 @@ function normalizeForContentDedupe(text) {
     .trim();
 }
 
-function contentHash(text) {
+export function contentHash(text) {
   const normalized = normalizeForContentDedupe(text);
   return createHash('sha256').update(normalized).digest('hex');
 }
@@ -541,7 +650,7 @@ function buildCandidateButtons(fields) {
   return { inline_keyboard: rows };
 }
 
-function buildCandidatePost(fields) {
+export function buildCandidatePost(fields) {
   const text = formatCandidatePost(fields);
   const reply_markup = buildCandidateButtons(fields);
   return { text, reply_markup };
@@ -1060,6 +1169,7 @@ async function runListener(accountId, flag) {
             groupLink,
             messageLink,
           });
+          maybeSendReviewDumpCandidate({ chatId, messageId }).catch(() => {});
         }
       } catch (err) {
         if (isAuthError(err)) fatalAuthErr = err;
@@ -1331,7 +1441,12 @@ async function runPreacher(accountId, flag) {
         lastName: myLast,
         fallbackUsername: account?.username || '',
       });
-      const mentionRegexes = compileMentionRegexes(tokens);
+      const acctNum = (account?.number ?? '').toString().trim();
+      if (acctNum) {
+        tokens.push(`preacher_${acctNum}`);
+        tokens.push(`preacher ${acctNum}`);
+      }
+      const mentionRegexes = compileMentionRegexes([...new Set(tokens)]);
       const handler = async (event) => {
         try {
           if (!joinWatch.size) return;
@@ -1339,8 +1454,8 @@ async function runPreacher(accountId, flag) {
           if (!message || message.out) return;
           const chat = await message.getChat().catch(() => null);
           const rawChatId = (message.chatId || chat?.id)?.toString?.() || null;
-          if (!rawChatId) return;
-          const internal = rawChatId.startsWith('-100') ? rawChatId.slice(4) : rawChatId.startsWith('-') ? rawChatId.slice(1) : rawChatId;
+          const internal = canonicalInternalChatId(rawChatId);
+          if (!internal) return;
           const rec = joinWatch.get(internal);
           if (!rec) return;
           if (Date.now() > rec.expiresAt) { joinWatch.delete(internal); return; }
@@ -1556,10 +1671,14 @@ async function runPreacher(accountId, flag) {
           joinedThisPhase++;
           takenLinks.add(link);
 
-          if (mentionRx && resolvedEntity?.id) {
-            const internal = resolvedEntity.id.toString();
+          if (resolvedEntity?.id) {
+            const internal = canonicalInternalChatId(resolvedEntity.id?.toString?.() || resolvedEntity.id);
+            if (!internal) {
+              await sleep(15000 + Math.random() * 20000);
+              continue;
+            }
             joinWatch.set(internal, {
-              expiresAt: Date.now() + Math.max(60_000, Number(process.env.PREACHER_JOIN_WATCH_MS || 2 * 60 * 1000)),
+              expiresAt: Date.now() + Math.max(60_000, Number(process.env.PREACHER_JOIN_WATCH_MS || 3 * 60 * 1000)),
               groupLink: link,
               groupTitle: resolvedEntity?.title || link,
               notified: false,

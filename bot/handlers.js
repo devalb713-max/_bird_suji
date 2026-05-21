@@ -18,12 +18,15 @@ import {
   MessageTemplate,
   QueuedPost,
   GroupLink,
+  AiQueueMessage,
+  PostDedupe,
 } from '../models/db.js';
 import { sendCodeWithRetry } from '../helpers/telegram.js';
 import { randomFingerprint } from '../helpers/fingerprint.js';
 import { startJoinWorker, stopJoinWorker, isJoinWorkerRunning, isAnyJoinWorkerRunning, startPoller } from '../workers/joinWorker.js';
 import { startMessageWorker, stopMessageWorker, isMessageWorkerRunning, isAnyMessageWorkerRunning } from '../workers/messageWorker.js';
 import { SEED_KEYWORDS } from '../models/keywords.js';
+import { buildCandidatePost, contentHash } from '../helpers/messenger.js';
 
 export async function isAdmin(userId, username) {
   await ensureAdminCacheLoaded();
@@ -2776,11 +2779,13 @@ export async function handleSettingsMenu(ctx) {
   const s = await getSettings();
   const [channels, groups] = await Promise.all([getMandatoryChannelIds(), getMandatoryGroupIds()]);
   const inviterIds = getSelectedInviterIds(s);
+  const reviewDump = s?.reviewDumpChatId ? s.reviewDumpChatId.toString() : 'not set';
   const text =
     `⚙️ *Settings*\n\n` +
     `Mandatory channels (approved): ${channels.length}\n` +
     `Mandatory groups (approved): ${groups.length}\n` +
     `Inviter accounts selected: ${inviterIds.length}\n\n` +
+    `Review dump chat: ${reviewDump}\n\n` +
     `Bot posting: ${s.botPostingEnabled ? '✅ ON' : '⛔ OFF'}\n` +
     `AI alerts: ${s.aiAlertsEnabled ? '✅ ON' : '⛔ OFF'}\n` +
     `Auto-resume workers: ${s.autoResumeWorkers ? '✅ ON' : '⛔ OFF'}`;
@@ -2789,6 +2794,9 @@ export async function handleSettingsMenu(ctx) {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [Markup.button.callback('Set Inviter Accounts', 'set_inviter_account')],
+      [Markup.button.callback('Pick Review Dump Group', 'review_dump_menu')],
+      [Markup.button.callback('Use This Chat As Dump', 'set_review_dump_here')],
+      [Markup.button.callback('Clear Review Dump', 'clear_review_dump')],
       [Markup.button.callback(s.autoResumeWorkers ? 'Disable Auto-Resume' : 'Enable Auto-Resume', 'toggle_auto_resume')],
       [Markup.button.callback(s.botPostingEnabled ? 'Disable Posting' : 'Enable Posting', 'toggle_posting')],
       [Markup.button.callback(s.aiAlertsEnabled ? 'Disable AI Alerts' : 'Enable AI Alerts', 'toggle_ai_alerts')],
@@ -2797,6 +2805,182 @@ export async function handleSettingsMenu(ctx) {
     ]),
   });
   await ctx.answerCbQuery();
+}
+
+export async function handleSetReviewDumpHere(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  if (ctx?.chat?.type !== 'group' && ctx?.chat?.type !== 'supergroup') {
+    await ctx.answerCbQuery('Open Settings inside the dump group, or use Pick Review Dump Group');
+    return handleSettingsMenu(ctx);
+  }
+  const chatId = ctx?.chat?.id;
+  if (!chatId) { await ctx.answerCbQuery('No chat'); return handleSettingsMenu(ctx); }
+  const s = await getSettings();
+  s.reviewDumpChatId = chatId.toString();
+  await s.save();
+  await ctx.answerCbQuery('✅ Review dump set');
+  return handleSettingsMenu(ctx);
+}
+
+export async function handleClearReviewDump(ctx) {
+  if (!(await requireAdmin(ctx))) return;
+  const s = await getSettings();
+  s.reviewDumpChatId = null;
+  await s.save();
+  await ctx.answerCbQuery('✅ Cleared');
+  return handleSettingsMenu(ctx);
+}
+
+export async function handleReviewDumpMenu(ctx, page = 0) {
+  if (!(await requireAdmin(ctx))) return;
+  const s = await getSettings();
+  const selected = s?.reviewDumpChatId ? s.reviewDumpChatId.toString() : null;
+  const PAGE_SIZE = 10;
+  const safePage = Math.max(0, Number.isFinite(page) ? page : 0);
+  const total = await BotChat.countDocuments({ type: { $ne: 'channel' } }).catch(() => 0);
+  const chats = await BotChat.find({ type: { $ne: 'channel' } }, { chatId: 1, title: 1, type: 1, username: 1 })
+    .sort({ createdAt: -1 })
+    .skip(safePage * PAGE_SIZE)
+    .limit(PAGE_SIZE)
+    .lean()
+    .catch(() => []);
+
+  const text =
+    `🧾 *Pick Review Dump Group*\n\n` +
+    `Add the bot to the group first, then it will show here.\n` +
+    `Current: ${selected || 'not set'}`;
+
+  const rows = (chats || []).map((c) => {
+    const cid = c?.chatId?.toString?.() || '';
+    const title = (c?.title || cid).toString();
+    const mark = selected === cid ? '✅ ' : '';
+    return [Markup.button.callback(`${mark}${title}`, `pick_review_dump_${cid}`)];
+  });
+
+  const nav = [];
+  const maxPage = Math.max(0, Math.ceil(total / PAGE_SIZE) - 1);
+  if (safePage > 0) nav.push(Markup.button.callback('« Prev', `review_dump_page_${safePage - 1}`));
+  if (safePage < maxPage) nav.push(Markup.button.callback('Next »', `review_dump_page_${safePage + 1}`));
+  if (nav.length) rows.push(nav);
+  rows.push([Markup.button.callback('« Back', 'settings_menu')]);
+
+  await safeEditMessageText(ctx, text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) });
+  await ctx.answerCbQuery();
+}
+
+export async function handlePickReviewDump(ctx, chatId) {
+  if (!(await requireAdmin(ctx))) return;
+  const id = (chatId || '').toString().trim();
+  if (!id) {
+    await ctx.answerCbQuery('Not found');
+    return handleReviewDumpMenu(ctx, 0);
+  }
+  const exists = await BotChat.exists({ chatId: id, type: { $ne: 'channel' } }).catch(() => null);
+  if (!exists) {
+    await ctx.answerCbQuery('Add bot to the group first');
+    return handleReviewDumpMenu(ctx, 0);
+  }
+  const s = await getSettings();
+  s.reviewDumpChatId = id;
+  await s.save();
+  await ctx.answerCbQuery('✅ Review dump set');
+  return handleReviewDumpMenu(ctx, 0);
+}
+
+async function getJobTargetChatIdsForPosting() {
+  const s = await getSettings();
+  const configured = s?.jobsTargetChatId ? Number(s.jobsTargetChatId) : null;
+  if (configured && Number.isFinite(configured)) return [configured];
+  const rows = await ApprovedChat.find({ type: { $ne: 'channel' } }, { chatId: 1 }).lean().catch(() => []);
+  return [...new Set(rows.map(r => Number(r.chatId)).filter(n => Number.isFinite(n)))];
+}
+
+async function handleReviewDecision(ctx, queueId, decision) {
+  if (!(await requireAdmin(ctx))) return;
+  const id = (queueId || '').toString().trim();
+  if (!id) {
+    await ctx.answerCbQuery('Not found');
+    return;
+  }
+
+  const doc = await AiQueueMessage.findById(id).lean().catch(() => null);
+  if (!doc) {
+    await ctx.answerCbQuery('Not found');
+    return;
+  }
+
+  const already = doc.reviewDecision;
+  if (already) {
+    await ctx.answerCbQuery(`Already ${already}`);
+    try { await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: `✅ ${already.toUpperCase()}`, callback_data: 'ui_noop' }]] }); } catch {}
+    return;
+  }
+
+  const now = new Date();
+  await AiQueueMessage.updateOne(
+    { _id: doc._id, reviewDecision: null },
+    { $set: { reviewDecision: decision, reviewDecidedBy: ctx.from.id.toString(), reviewDecidedAt: now } }
+  ).catch(() => {});
+
+  if (decision === 'approved') {
+    const settings = await getSettings();
+    const targets = await getJobTargetChatIdsForPosting();
+    if (targets.length) {
+      const payload = {
+        message: doc.text,
+        senderName: doc.senderName,
+        senderUsername: doc.senderUsername,
+        senderId: doc.senderId,
+        groupId: doc.groupId || null,
+        groupLink: doc.groupLink,
+        messageLink: doc.messageLink,
+      };
+
+      if (settings.botPostingEnabled) {
+        const out = buildCandidatePost(payload);
+        for (const target of targets) {
+          const groupKey = doc.chatId || doc.groupId || '';
+          const txtKey = `txt:${groupKey}::${contentHash(doc.text)}::${target}`;
+          const insertedTxt = await PostDedupe.create({
+            key: txtKey,
+            sourceChatId: doc.chatId || null,
+            sourceMessageId: doc.messageId ?? null,
+            targetChatId: target.toString(),
+          }).then(() => true).catch(() => false);
+          if (!insertedTxt) continue;
+
+          const srcKey = `src:${doc.chatId || ''}::${doc.messageId ?? ''}::${target}`;
+          if (doc.chatId && doc.messageId != null) {
+            await PostDedupe.create({
+              key: srcKey,
+              sourceChatId: doc.chatId || null,
+              sourceMessageId: doc.messageId ?? null,
+              targetChatId: target.toString(),
+            }).catch(() => {});
+          }
+
+          await ctx.telegram.sendMessage(target, out.text, {
+            disable_web_page_preview: true,
+            parse_mode: 'HTML',
+            reply_markup: out.reply_markup || undefined,
+          }).catch(() => {});
+        }
+      } else {
+        await QueuedPost.create(payload).catch(() => {});
+      }
+    }
+  }
+
+  await ctx.answerCbQuery(decision === 'approved' ? '✅ Approved' : '⛔ Declined');
+  try { await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: decision === 'approved' ? '✅ APPROVED' : '⛔ DECLINED', callback_data: 'ui_noop' }]] }); } catch {}
+}
+
+export async function handleReviewApprove(ctx, queueId) {
+  return handleReviewDecision(ctx, queueId, 'approved');
+}
+
+export async function handleReviewDecline(ctx, queueId) {
+  return handleReviewDecision(ctx, queueId, 'declined');
 }
 
 export async function handleSetInviterAccount(ctx) {
@@ -3792,6 +3976,13 @@ export function setupHandlers(bot) {
   bot.action('set_inviter_account', handleSetInviterAccount);
   bot.action(/^pick_inviter_(.+)$/, ctx => handlePickInviterAccount(ctx, ctx.match[1]));
   bot.action('clear_inviter_account', handleClearInviterAccount);
+  bot.action('set_review_dump_here', handleSetReviewDumpHere);
+  bot.action('clear_review_dump', handleClearReviewDump);
+  bot.action('review_dump_menu', (ctx) => handleReviewDumpMenu(ctx, 0));
+  bot.action(/^review_dump_page_(\d+)$/, (ctx) => handleReviewDumpMenu(ctx, parseInt(ctx.match[1])));
+  bot.action(/^pick_review_dump_(-?\d+)$/, (ctx) => handlePickReviewDump(ctx, ctx.match[1]));
+  bot.action(/^review_ok_(.+)$/i, ctx => handleReviewApprove(ctx, ctx.match[1]));
+  bot.action(/^review_no_(.+)$/i, ctx => handleReviewDecline(ctx, ctx.match[1]));
 
   bot.on('chat_member', handleChatMember);
   bot.on('my_chat_member', handleMyChatMember);

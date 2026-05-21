@@ -96,6 +96,7 @@ const botSettingsSchema = new mongoose.Schema(
     requiredGroupId: { type: String, default: null },
     requiredGroupInviteLink: { type: String, default: null },
     jobsTargetChatId: { type: String, default: null },
+    reviewDumpChatId: { type: String, default: null },
     inviterAccountId: { type: String, default: null },
     inviterAccountIds: { type: [String], default: [] },
     botPostingEnabled: { type: Boolean, default: true },
@@ -237,6 +238,15 @@ const aiQueueMessageSchema = new mongoose.Schema(
     groupId: { type: String, default: null },
     groupLink: { type: String, default: null },
     messageLink: { type: String, default: null },
+
+    reviewScore: { type: Number, default: null },
+    reviewMatched: { type: [String], default: [] },
+    reviewSentAt: { type: Date, default: null, index: true },
+    reviewDumpChatId: { type: String, default: null },
+    reviewDumpMessageId: { type: Number, default: null },
+    reviewDecision: { type: String, enum: ['approved', 'declined'], default: null, index: true },
+    reviewDecidedBy: { type: String, default: null },
+    reviewDecidedAt: { type: Date, default: null },
 
     status: { type: String, enum: ['pending', 'processing', 'done'], default: 'pending', index: true },
     decision: { type: Boolean, default: null },
